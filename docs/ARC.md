@@ -52,33 +52,46 @@ Top-level: `token_embd.weight` [2048, 151669] Q1_0, `output_norm.weight` [2048] 
 | M4 Pro 48GB | llama.cpp Metal | 250 | 3.8x |
 | RTX 4090 | llama.cpp CUDA | 674 | 3.0x |
 
-## Milestones
+## Locked plan (5 weeks, P1 + P3 scope)
 
-### P0 — weights load + single forward step (native CLI)
-- Download Bonsai 1.7B from Hugging Face
-- Inspect safetensors layout, document tensor names / shapes / dtypes
-- Load weights into Almide Matrix representation
-- Run one forward step end-to-end, compare logits against HF reference (numerical match within tolerance)
+The narrative we want: **"One URL → Bonsai runs in browser. Written in a language I wrote."** Native llama.cpp-beating perf is not the win condition — browser deployability + solo full-stack is.
 
-### P1 — greedy generation + tok/s baseline (native)
-- Implement KV cache
-- Greedy sampling loop, 100-token generation
-- Report tok/s on M-series Mac native
-- Acceptance: coherent English output, tok/s measured
+### Week 1 — nn extensions (foundation)
+- [ ] `nn/gguf.almd`: Q1_0 (dtype=41) block decode — 18 bytes → 128 fp32 weights
+- [ ] `nn/gguf.almd`: tokenizer metadata loader (vocab / merges / chat template extraction)
+- [ ] `nn/src/quantized.almd` (new): Q1_0 linear primitive (can start as pure-Almide, promote to intrinsic in week 4)
+- [ ] Unit tests: single block round-trip, dtype dispatch, scale sign correctness
 
-### P2 — WASM build + Node demo
-- Compile bonsai pipeline to WASM via `almide build --target wasm`
-- Run in Node.js with weights loaded from disk
-- Report WASM tok/s
+### Week 2 — Qwen3 architecture primitives
+- [ ] GQA variant of `masked_multi_head_attention` (16 Q / 8 KV, head_dim 128)
+- [ ] YaRN RoPE in `nn/attention.almd` (factor 4.0, orig ctx 8192)
+- [ ] Per-block Q-norm / K-norm hooks
+- [ ] `nn/src/qwen3.almd` (new): qwen3_block composing RMSNorm → Q/K norm → GQA → RoPE → out + SwiGLU
 
-### P3 — browser demo + benchmark page
-- Single HTML page: load weights, stream tokens in browser
-- Benchmark table: bonsai-almide vs bonsai.cpp vs transformers.js
-- Publish to GitHub Pages
+### Week 3 — forward pass correctness (P0-equivalent)
+- [ ] `bonsai-almide/src/model.almd`: load Bonsai-1.7B GGUF, build all 28 layer weights
+- [ ] Single-token forward pass, dump logits
+- [ ] Compare against llama.cpp reference logits (tolerance TBD, 1-bit is fragile)
+- [ ] Acceptance: top-5 tokens match HF on 3 seed prompts
 
-### P4 — WebGPU backend (stretch)
-- Add WebGPU kernels for 1-bit matmul
-- Target 200 tok/s in browser
+### Week 4 — generation + native tok/s (P1 done)
+- [ ] KV cache in `nn/attention.almd`
+- [ ] `bonsai-almide/src/generate.almd`: greedy / top-k / top-p sampling from GGUF metadata defaults
+- [ ] `bonsai-almide/examples/cli.almd`: `bonsai run "prompt"`
+- [ ] Bench 100-token generation on M-series, record tok/s in README
+- [ ] Promote Q1_0 linear from pure-Almide to `@intrinsic` (Rust impl, egg fusion rules)
+
+### Week 5 — WASM + browser demo (P3 done)
+- [ ] `almide build --target wasm` produces working `bonsai.wasm`
+- [ ] `examples/browser_demo/`: `index.html` + JS glue (adapt from `nn/examples/browser_demo/`)
+- [ ] Weights load via `fetch` with streaming; IndexedDB cache
+- [ ] Benchmark table: native vs WASM vs llama.cpp native vs transformers.js
+- [ ] Publish to GitHub Pages; README updated with live URL
+
+### Stretch (post-P3)
+- WebGPU backend for Q1_0 matmul (target 150 tok/s browser)
+- 4B and 8B model support
+- Chat UI (not just single-turn)
 
 ## Architecture diff vs existing Almide llama_block
 
@@ -92,6 +105,10 @@ Top-level: `token_embd.weight` [2048, 151669] Q1_0, `output_norm.weight` [2048] 
 | Tokenizer | n/a | GPT-2 BPE, 151k vocab + qwen2 pre-tokenizer — load from GGUF metadata |
 | Model structure | single block | 28 layers + KV cache + tied embed/lm_head |
 | Weight loader | nn has GGUF F16/F32 | extend `nn/gguf.almd` with dtype 41 (Q1_0) decode |
+
+## Known upstream blockers
+
+- **almide `fs.stat` / `FileStat` codegen bug** (2026-04-20): compiling any package that pulls in `fs.stat` (including `nn` via `nn/gguf.almd`) produces invalid Rust — `FileStat` struct is referenced from `runtime/rs/src/fs.rs` but its definition is missing from the generated runtime glue. Work is in progress on the `fix/filestat-dedup-empty` branch of the `almide` repo. bonsai-almide probe (`examples/probe_gguf.almd`) is pre-written and waiting for that fix to land.
 
 ## Technical risks
 

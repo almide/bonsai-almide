@@ -1,0 +1,59 @@
+// probe_gguf — validate the full toolchain loads Bonsai-1.7B-Q1_0.gguf
+//
+// Goals:
+//   1. nn.gguf can parse the GGUF v3 header
+//   2. metadata extraction works
+//   3. Q1_0 tensor info (dtype=41) is recognized even without decoding
+//   4. Manual Q1_0 block layout matches our offset arithmetic
+//
+// This is the foothold before implementing the Q1_0 decoder proper.
+
+import nn.gguf as gguf
+
+fn dims_str(dims: List[Int]) -> String =
+  dims |> list.map((d) => int.to_string(d)) |> list.join("x")
+
+effect fn main() -> Unit = {
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+
+  println("=== header ===")
+  println("  version: " + int.to_string(file.header.version))
+  println("  tensors: " + int.to_string(file.header.tensor_count))
+  println("  metadata: " + int.to_string(file.header.metadata_count))
+
+  println("=== first 5 tensors ===")
+  let first5 = list.take(file.tensors, 5)
+  for t in first5 {
+    println(
+      "  " + t.name +
+      " [" + dims_str(t.dims) + "]" +
+      " dtype=" + int.to_string(t.dtype) +
+      " off=" + int.to_string(t.offset)
+    )
+  }
+
+  println("=== Q1_0 block offset check ===")
+  // token_embd (Q1_0, 2048 x 151669): 2,426,704 groups * 18 bytes = 43,680,672
+  // blk.0.attn_k offset - token_embd offset should equal that.
+  match list.find(file.tensors, (t) => t.name == "token_embd.weight") {
+    some(embd) => {
+      match list.find(file.tensors, (t) => t.name == "blk.0.attn_k.weight") {
+        some(ak) => {
+          let gap = ak.offset - embd.offset
+          let elements = 2048 * 151669
+          let expected = elements / 128 * 18
+          println("  embd offset:   " + int.to_string(embd.offset))
+          println("  ak offset:     " + int.to_string(ak.offset))
+          println("  gap:           " + int.to_string(gap))
+          println("  expected (Q1_0): " + int.to_string(expected))
+          if gap == expected then
+            println("  LAYOUT OK: Q1_0 = 18 bytes per 128 weights")
+          else
+            println("  LAYOUT MISMATCH")
+        },
+        none => println("  blk.0.attn_k.weight not found"),
+      }
+    },
+    none => println("  token_embd.weight not found"),
+  }
+}
