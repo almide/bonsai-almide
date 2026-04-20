@@ -1,0 +1,7 @@
+[package]
+name = "bonsai"
+version = "0.1.0"
+description = "Bonsai 1-bit LLM inference in Almide — AOT compiled, native + WASM"
+
+[dependencies]
+nn = { git = "file:///Users/o6lvl4/workspace/github.com/almide/nn" }

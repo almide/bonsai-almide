@@ -1,0 +1,7 @@
+target/
+weights/*.safetensors
+weights/*.bin
+weights/*.gguf
+*.wasm
+.DS_Store
+*.rmeta
