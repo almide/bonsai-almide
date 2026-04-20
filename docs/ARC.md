@@ -4,17 +4,38 @@
 
 Run Bonsai 1.7B / 4B / 8B end-to-end on Almide, matching or beating the llama.cpp reference implementation on native and adding a browser-deployable WASM path. The repo doubles as a public benchmark that Almide's AOT + egg fusion pipeline delivers on a real, non-trivial ML workload.
 
-## Target spec (Bonsai-1.7B)
+## Target spec (Bonsai-1.7B — confirmed from GGUF metadata)
 
-- Format: `Q1_0` GGUF, 248 MB
-- Layers: 28 Transformer decoder blocks
-- Attention: **GQA — 16 query heads, 8 KV heads**
-- MLP: SwiGLU, Norm: RMSNorm, PE: RoPE
-- Vocab: 151,936, Context: 32,768
-- Base: Qwen3-1.7B dense, trained 1-bit from scratch
-- Tokenizer: Qwen3 BPE, embedded in GGUF metadata
-- Chat template: embedded in GGUF metadata
-- Coverage: embeddings, attention, MLP, and LM head are all 1-bit
+- Format: `Q1_0` GGUF, 248 MB (GGUF v3, 310 tensors, 32 metadata entries)
+- Architecture: `qwen3` (declared in metadata)
+- Layers: 28 decoder blocks
+- Hidden: 2048, FFN: 6144
+- Attention: GQA — 16 query heads, 8 KV heads, head_dim 128 (key_length = value_length = 128)
+- **Per-block Q/K norm**: `attn_q_norm` and `attn_k_norm` per layer (Qwen3-specific; not in standard Llama)
+- RoPE: **YaRN scaling** — original_context 8192, scaling factor 4.0, extended context 32768, freq_base 1,000,000
+- RMSNorm epsilon: ~1e-6 (9.999999974752427e-07)
+- Tokenizer model: `gpt2` BPE with `qwen2` pre-tokenizer; vocab 151,669 tokens, merges 151,387
+- EOS: 151645, PAD: 151643, no BOS
+- Chat template: Qwen3 ChatML with tool-use support (embedded)
+- LM head: **tied to `token_embd.weight`** (no separate `output.weight` tensor)
+- Q1_0 dtype = **41** (GGML custom type for this fork). 197 of 310 tensors are Q1_0; the remaining 113 are F32 norm scales.
+
+## Tensor inventory (per block)
+
+Each of the 28 blocks has 11 tensors:
+- `attn_norm.weight` [2048] F32
+- `attn_q.weight` [2048, 2048] Q1_0
+- `attn_q_norm.weight` [128] F32
+- `attn_k.weight` [2048, 1024] Q1_0
+- `attn_k_norm.weight` [128] F32
+- `attn_v.weight` [2048, 1024] Q1_0
+- `attn_output.weight` [2048, 2048] Q1_0
+- `ffn_norm.weight` [2048] F32
+- `ffn_gate.weight` [2048, 6144] Q1_0
+- `ffn_up.weight` [2048, 6144] Q1_0
+- `ffn_down.weight` [6144, 2048] Q1_0
+
+Top-level: `token_embd.weight` [2048, 151669] Q1_0, `output_norm.weight` [2048] F32.
 
 ## Q1_0 packing format
 
@@ -61,14 +82,16 @@ Run Bonsai 1.7B / 4B / 8B end-to-end on Almide, matching or beating the llama.cp
 
 ## Architecture diff vs existing Almide llama_block
 
-| Concern | llama_block (existing) | Bonsai (new) |
+| Concern | llama_block (existing) | Bonsai / Qwen3 (new) |
 |---|---|---|
 | Attention | MHA (`masked_multi_head_attention`) | **GQA 16/8** — new matrix intrinsic |
+| Q/K norm | none | **per-block RMSNorm on Q and K** before RoPE (Qwen3-specific) |
+| RoPE | standard | **YaRN scaling** (factor 4.0, orig 8192 → 32768) |
 | Weights dtype | Float32 dense | **Q1_0 packed** (sign bits + fp16 scales/group 128) — new kernel |
 | Linear | `linear_row_no_bias` (dense fp32) | `linear_q1_0_row` — new |
-| Tokenizer | n/a | **Qwen3 BPE** — new module (embedded in GGUF metadata) |
-| Model structure | single block | 28 layers + KV cache + tied embed + lm_head (all 1-bit) |
-| Weight loader | nn has GGML F16/F32 | extend to GGUF Q1_0 block decode |
+| Tokenizer | n/a | GPT-2 BPE, 151k vocab + qwen2 pre-tokenizer — load from GGUF metadata |
+| Model structure | single block | 28 layers + KV cache + tied embed/lm_head |
+| Weight loader | nn has GGUF F16/F32 | extend `nn/gguf.almd` with dtype 41 (Q1_0) decode |
 
 ## Technical risks
 
