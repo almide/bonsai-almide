@@ -5,3 +5,4 @@ weights/*.gguf
 *.wasm
 .DS_Store
 *.rmeta
+.almide/
