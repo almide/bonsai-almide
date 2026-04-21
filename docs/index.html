@@ -42,8 +42,8 @@
   </div>
   <div class="row">
     Max new tokens:
-    <input id="maxNew" type="number" value="3" min="1" max="3" style="width: 4em" />
-    <button id="sendBtn" disabled>Send (KV cache, ~1.5 s/tok after prompt)</button>
+    <input id="maxNew" type="number" value="12" min="1" max="30" style="width: 4em" />
+    <button id="sendBtn" disabled>Send (~10 s / token streaming)</button>
     <span id="runStatus" class="status">waiting for model…</span>
   </div>
   <div id="chat" class="chat"></div>
@@ -56,7 +56,7 @@
 
 <p class="footer">
   Each generated token re-runs a full 28-layer forward
-  (<code>predict_tokens_kv</code>, KV cache). First token ≈ 8 s (full prompt forward), subsequent tokens ≈ 1.5 s each. Max 3 new tokens here because Almide's WASM bump allocator grows unbounded per gen step and would bust the 4 GB address space otherwise (heap-reclaim fix tracked separately).
+  (<code>predict_next</code>, streaming). ~10 s per token on M1 (no KV cache in this build — the KV path exists but needs a WASM allocator refactor before browser chat can go fast).
   Each weight matrix stays packed in Q1_0 throughout via <code>matrix.linear_q1_0_row_no_bias</code>.
   Model is cached in IndexedDB on first run; subsequent loads are instant.
 </p>
@@ -242,25 +242,35 @@ $('sendBtn').addEventListener('click', async () => {
     chatEl.innerHTML = '<span class="user">' + prompt + '</span><span class="ai"></span>';
     const aiEl = chatEl.querySelector('.ai');
 
-    // KV-cache one-shot path: prompt-eval + nNew gen steps happen inside
-    // one Almide call (`predict_tokens_kv`), so we don't get per-token
-    // streaming in the UI, but we do get ~6.9x speedup over the per-token
-    // `predict_next` path. The Almide-side caches never leave WASM memory,
-    // which also means we can't __heap_restore between steps — that's why
-    // n_new is capped at 3 here (4 GB WASM cap).
-    runStatus(`generating ${nNew} token${nNew > 1 ? 's' : ''} via KV cache (prompt ${tokens.length} tok)…`);
-    await new Promise((r) => setTimeout(r, 30));
-    const promptPtr = writeTokenList(tokens);
-    const t0 = performance.now();
-    const rp = wasmInstance.exports.predict_tokens_kv(modelPtr, promptPtr, BigInt(nNew)) >>> 0;
-    const generated = readResultIntList(rp);
-    const elapsed = performance.now() - t0;
-    const text = tokenizer.decode(generated, { skip_special_tokens: false });
-    aiEl.textContent = text;
-    for (let i = 0; i < generated.length; i++) {
-      log(`  token ${i + 1}: ${generated[i]} → ${JSON.stringify(tokenizer.decode([generated[i]]))}`);
+    // Streaming path: one predict_next call per token, with __heap_restore
+    // between steps so the WASM bump allocator stays flat. KV-cache path
+    // is in the binary (predict_next_kv / predict_tokens_kv) but the
+    // browser demo doesn't use it yet — the heap-layout refactor required
+    // to cache across JS boundaries while reclaiming scratch is a separate
+    // arc (see bench/README.md roadmap).
+    const { __heap_save, __heap_restore } = wasmInstance.exports;
+    const sessionMark = __heap_save() >>> 0;
+
+    const context = [...tokens];
+    const generated = [];
+    let totalElapsed = 0;
+    for (let step = 0; step < nNew; step++) {
+      runStatus(`generating token ${step + 1}/${nNew} (context ${context.length} tokens, ~10 s each)…`);
+      await new Promise((r) => setTimeout(r, 30));
+      const tokensPtr = writeTokenList(context);
+      const t0 = performance.now();
+      const rp = wasmInstance.exports.predict_next(modelPtr, tokensPtr);
+      const next = readResultInt(rp);
+      const elapsed = performance.now() - t0;
+      totalElapsed += elapsed;
+      __heap_restore(sessionMark);
+      context.push(next);
+      generated.push(next);
+      const partial = tokenizer.decode(generated, { skip_special_tokens: false });
+      aiEl.textContent = partial;
+      log(`  step ${step + 1}: token ${next} → ${JSON.stringify(tokenizer.decode([next]))} in ${(elapsed / 1000).toFixed(1)}s`);
     }
-    runStatus(`done — ${generated.length} tokens in ${(elapsed / 1000).toFixed(1)}s total (${(elapsed / generated.length / 1000).toFixed(1)}s / token avg).`, 'ok');
+    runStatus(`done — ${nNew} tokens in ${(totalElapsed / 1000).toFixed(1)}s total (${(totalElapsed / nNew / 1000).toFixed(1)}s / token).`, 'ok');
   } catch (err) {
     runStatus('error: ' + err.message, 'error');
     log('ERROR: ' + (err.stack || err));
