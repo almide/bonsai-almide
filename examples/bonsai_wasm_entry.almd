@@ -400,6 +400,73 @@ effect fn predict_next_kv(
 // ArrayBuffer, `__heap_restore` the scratch, and feed the cache back
 // in for the next step. Shape isn't carried — `kv_hidden = 1024` is
 // constant and `rows = bytes.len(b) / 8 / kv_hidden`.
+//
+// `init_model` + `predict_*_cached` skip the per-step `gguf.parse` by
+// parsing once at boot (JS keeps the GGUFFile pointer below the heap
+// watermark so it survives __heap_restore).
+
+effect fn init_model(model_bytes: Bytes) -> Result[gguf.GGUFFile, String] =
+  ok(gguf.parse(model_bytes)!)
+
+effect fn predict_prompt_kv_cached(
+  file: gguf.GGUFFile,
+  prompt: List[Int],
+  temperature: Float,
+  top_k: Int,
+  rand01: Float,
+  repeat_penalty: Float,
+) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
+  let kv_hidden = 8 * 128
+  let n_layers = 28
+
+  var keys: List[Matrix] = []
+  var values: List[Matrix] = []
+  for _ in 0..n_layers {
+    list.push(keys, matrix.zeros(0, kv_hidden))
+    list.push(values, matrix.zeros(0, kv_hidden))
+  }
+
+  let (next, new_keys, new_values) = predict_next_kv(
+    file, keys, values, prompt, 0,
+    temperature, top_k, rand01, prompt, repeat_penalty,
+  )!
+  let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
+  let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
+  ok((next, k_bytes, v_bytes))
+}
+
+effect fn predict_step_kv_cached(
+  file: gguf.GGUFFile,
+  kv_keys_bytes: List[Bytes],
+  kv_values_bytes: List[Bytes],
+  last_token: Int,
+  start_pos: Int,
+  recent_tokens: List[Int],
+  temperature: Float,
+  top_k: Int,
+  rand01: Float,
+  repeat_penalty: Float,
+) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
+  let kv_hidden = 8 * 128
+
+  let keys = kv_keys_bytes |> list.map((b) => {
+    let rows = bytes.len(b) / 8 / kv_hidden
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+  })
+  let values = kv_values_bytes |> list.map((b) => {
+    let rows = bytes.len(b) / 8 / kv_hidden
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+  })
+
+  let (next, new_keys, new_values) = predict_next_kv(
+    file, keys, values, [last_token], start_pos,
+    temperature, top_k, rand01, recent_tokens, repeat_penalty,
+  )!
+  let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
+  let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
+  ok((next, k_bytes, v_bytes))
+}
+
 effect fn predict_prompt_kv_bytes(
   model_bytes: Bytes,
   prompt: List[Int],
