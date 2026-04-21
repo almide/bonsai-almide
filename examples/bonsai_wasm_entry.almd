@@ -461,6 +461,36 @@ effect fn predict_step_kv_bytes(
   ok((next, k_bytes, v_bytes))
 }
 
+// Diagnostic: prompt-eval + 1 step, kv kept in Almide memory throughout
+// (no bytes round-trip). If this returns the same first-gen token as
+// bench path 2 (List[Bytes] shuttling) → the bug is in the step-wise
+// forward itself. If it returns the path-4 token → the bug is in
+// serialization.
+effect fn probe_prompt_then_step(
+  model_bytes: Bytes,
+  prompt: List[Int],
+  follow_token: Int,
+) -> Result[Int, String] = {
+  let file = gguf.parse(model_bytes)!
+  let kv_hidden = 8 * 128
+  let n_layers = 28
+
+  var keys: List[Matrix] = []
+  var values: List[Matrix] = []
+  for _ in 0..n_layers {
+    list.push(keys, matrix.zeros(0, kv_hidden))
+    list.push(values, matrix.zeros(0, kv_hidden))
+  }
+
+  let (_first, k1, v1) = predict_next_kv(
+    file, keys, values, prompt, 0, 0.0, 1, 0.0, [], 1.0,
+  )!
+  let (second, _k2, _v2) = predict_next_kv(
+    file, k1, v1, [follow_token], list.len(prompt), 0.0, 1, 0.0, [], 1.0,
+  )!
+  ok(second)
+}
+
 // Single-shot KV-cache generation: prompt-eval + n_new gen steps with
 // the caches kept entirely Almide-side. Returns just the generated
 // token-id list (prompt not included). JS hosts can't easily reach

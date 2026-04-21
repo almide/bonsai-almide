@@ -169,6 +169,16 @@ async function main() {
     console.log(`  step ${step}: next = ${r.next}  in ${elapsed.toFixed(0)} ms  peak heap ${(memory.buffer.byteLength / 1024 / 1024).toFixed(0)} MB`);
   }
   console.log(`generated: ${generated.join(', ')}`);
+
+  if (process.env.DECODE === '1') {
+    const { AutoTokenizer } = await import('@huggingface/transformers');
+    const tok = await AutoTokenizer.from_pretrained('Qwen/Qwen3-1.7B');
+    const promptText = tok.decode(prompt, { skip_special_tokens: false });
+    const genText = tok.decode(generated, { skip_special_tokens: false });
+    console.log(`prompt:    ${JSON.stringify(promptText)}`);
+    console.log(`generated: ${JSON.stringify(genText)}`);
+    console.log(`full:      ${JSON.stringify(promptText + genText)}`);
+  }
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
