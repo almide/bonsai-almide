@@ -1,0 +1,22 @@
+// probe_matrix_only — measure extract_q1_0_matrix (intrinsic path) alone.
+
+import nn.gguf as gguf
+
+effect fn main() -> Unit = {
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+
+  match list.find(file.tensors, (t) => t.name == "blk.0.attn_k.weight") {
+    some(info) => {
+      println("Extracting blk.0.attn_k (2048x1024 Q1_0)...")
+      let m = gguf.extract_q1_0_matrix(file, info)
+      let (r, c) = matrix.shape(m)
+      println("  shape: " + int.to_string(r) + "x" + int.to_string(c))
+      let rows = matrix.to_lists(m)
+      let row0 = list.get_or(rows, 0, [])
+      let first4 = list.take(row0, 4) |> list.map((v) => float.to_string(v)) |> list.join(", ")
+      println("  first 4: " + first4)
+      println("EXTRACT OK")
+    },
+    none => println("not found"),
+  }
+}

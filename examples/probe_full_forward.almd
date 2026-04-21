@@ -1,0 +1,122 @@
+// probe_full_forward — 28-layer Bonsai forward pass (the real deal).
+//
+// Per-layer extract + qwen3_block so peak memory stays near one layer
+// (~400 MB F32) instead of 11 GB for the full decoded model. Cold-run
+// cost is dominated by Q1_0 decode (~45 min total at the current
+// 525 k weights/s Almide pace) — we print per-layer progress so the
+// watch-dog has something to chew on.
+
+import nn.gguf as gguf
+import nn.qwen3 as q3
+import datetime
+
+fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
+  match list.find(file.tensors, (t) => t.name == name) {
+    some(t) => ok(t),
+    none => err("tensor not found: " + name),
+  }
+
+fn block_tensor_name(layer: Int, suffix: String) -> String =
+  "blk." + int.to_string(layer) + "." + suffix
+
+effect fn run_layer(
+  file: gguf.GGUFFile,
+  h: Matrix,
+  layer: Int,
+  n_q_heads: Int, n_kv_heads: Int, head_dim: Int,
+  rope_theta: Float, eps: Float,
+) -> Result[Matrix, String] = {
+  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!)
+  let q_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!)
+  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!)
+  let ffn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!)
+
+  let w_q = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_q.weight"))!)
+  let w_k = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_k.weight"))!)
+  let w_v = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_v.weight"))!)
+  let w_o = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_output.weight"))!)
+  let w_gate = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_gate.weight"))!)
+  let w_up = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_up.weight"))!)
+  let w_down = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_down.weight"))!)
+
+  ok(q3.qwen3_block(
+    h,
+    attn_norm_gamma,
+    w_q, w_k, w_v, w_o,
+    q_norm_gamma, k_norm_gamma,
+    ffn_norm_gamma,
+    w_gate, w_up, w_down,
+    n_q_heads, n_kv_heads, head_dim,
+    rope_theta, eps,
+  ))
+}
+
+fn row_stats(m: Matrix) -> (Float, Float) = {
+  let rows = matrix.to_lists(m)
+  let row0 = list.get_or(rows, 0, [])
+  let sum_abs = row0 |> list.fold(0.0, (acc, v) => acc + float.abs(v))
+  let max_abs = row0 |> list.fold(0.0, (acc, v) => {
+    let a = float.abs(v)
+    if a > acc then a else acc
+  })
+  (sum_abs, max_abs)
+}
+
+effect fn main() -> Unit = {
+  println("Loading GGUF...")
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+  println("  tensors: " + int.to_string(list.len(file.tensors)))
+
+  let hidden = 2048
+  let n_q_heads = 16
+  let n_kv_heads = 8
+  let head_dim = 128
+  let rope_theta = 1000000.0
+  let eps = 0.000001
+  let n_layers = 28
+
+  // Input: single-position hidden-state with a mild deterministic pattern
+  // (stand-in for an embedded token). Skips token_embd lookup for now —
+  // we only care that 28 layers flow without blowup.
+  let row_vals = list.range(0, hidden)
+    |> list.map((i) => int.to_float(i % 11) * 0.05 - 0.25)
+  var h = matrix.from_lists([row_vals])
+
+  let (init_sum, init_max) = row_stats(h)
+  println("input: sum|.|=" + float.to_string(init_sum) + " max|.|=" + float.to_string(init_max))
+
+  for layer in 0..n_layers {
+    println("[layer " + int.to_string(layer) + "/" + int.to_string(n_layers) + "] extracting + forward...")
+    h = run_layer(file, h, layer, n_q_heads, n_kv_heads, head_dim, rope_theta, eps)!
+    let (s, m) = row_stats(h)
+    println("  done. sum|.|=" + float.to_string(s) + " max|.|=" + float.to_string(m))
+  }
+
+  // Final output_norm + tied lm_head.
+  println("Final output_norm + tied lm_head...")
+  let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
+  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
+  println("  output_norm done")
+
+  // Tied lm_head: logits = normed @ token_embd^T. token_embd is
+  // [vocab=151669, hidden=2048] after our extract (rows=out=151669,
+  // cols=in=2048). linear_row_no_bias(normed, token_embd) matches.
+  let token_embd = gguf.extract_q1_0_matrix(file, find_tensor(file, "token_embd.weight")!)
+  println("  token_embd decoded")
+  let logits = matrix.linear_row_no_bias(normed, token_embd)
+  let (lr, lc) = matrix.shape(logits)
+  println("  logits shape: " + int.to_string(lr) + " x " + int.to_string(lc))
+
+  // Argmax: top token id.
+  let logit_row = matrix.to_lists(logits) |> list.first |> option.unwrap_or([])
+  let (best_id, best_val) = logit_row
+    |> list.enumerate
+    |> list.fold((0, -1000000000.0), (acc, entry) => {
+      let (best_i, best_v) = acc
+      let (i, v) = entry
+      if v > best_v then (i, v) else (best_i, best_v)
+    })
+  println("  top token: id=" + int.to_string(best_id) + " logit=" + float.to_string(best_val))
+
+  println("FULL FORWARD OK")
+}

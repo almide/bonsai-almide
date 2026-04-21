@@ -1,0 +1,103 @@
+// probe_layer_timing — break down a single blk.0 forward into its
+// component matrix ops and time each in ns. Find where the 60 s is
+// actually spent so we know what to optimise next.
+
+import nn.gguf as gguf
+import nn.qwen3 as q3
+import datetime
+
+fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
+  match list.find(file.tensors, (t) => t.name == name) {
+    some(t) => ok(t),
+    none => err("not found: " + name),
+  }
+
+fn lap(label: String, t0: Int) -> Int = {
+  let t = datetime.monotonic_ns()
+  let ms = (t - t0) / 1000000
+  println(label + ": " + int.to_string(ms) + " ms")
+  t
+}
+
+effect fn main() -> Unit = {
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+
+  let hidden = 2048
+  let n_q_heads = 16
+  let n_kv_heads = 8
+  let head_dim = 128
+  let rope_theta = 1000000.0
+  let eps = 0.000001
+
+  println("--- extract blk.0 ---")
+  let t0 = datetime.monotonic_ns()
+  let w_q = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.attn_q.weight")!)
+  let t1 = lap("  w_q (2048x2048 Q1_0)", t0)
+  let w_k = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.attn_k.weight")!)
+  let t2 = lap("  w_k (1024x2048 Q1_0)", t1)
+  let w_v = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.attn_v.weight")!)
+  let t3 = lap("  w_v", t2)
+  let w_o = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.attn_output.weight")!)
+  let t4 = lap("  w_o", t3)
+  let w_gate = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.ffn_gate.weight")!)
+  let t5 = lap("  w_gate (6144x2048 Q1_0)", t4)
+  let w_up = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.ffn_up.weight")!)
+  let t6 = lap("  w_up", t5)
+  let w_down = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.ffn_down.weight")!)
+  let t7 = lap("  w_down", t6)
+
+  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "blk.0.attn_norm.weight")!)
+  let q_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "blk.0.attn_q_norm.weight")!)
+  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "blk.0.attn_k_norm.weight")!)
+  let ffn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "blk.0.ffn_norm.weight")!)
+  let t8 = lap("  all 4 norm gammas (F32)", t7)
+
+  println("--- forward ---")
+  let row_vals = list.range(0, hidden)
+    |> list.map((i) => int.to_float(i % 11) * 0.05 - 0.25)
+  let x = matrix.from_lists([row_vals])
+  let t9 = lap("  build input matrix", t8)
+
+  let h = matrix.rms_norm_rows(x, attn_norm_gamma, eps)
+  let t10 = lap("  rms_norm_rows (pre-attn)", t9)
+  let q_proj = matrix.linear_row_no_bias(h, w_q)
+  let t11 = lap("  linear q_proj", t10)
+  let k_proj = matrix.linear_row_no_bias(h, w_k)
+  let t12 = lap("  linear k_proj", t11)
+  let v_proj = matrix.linear_row_no_bias(h, w_v)
+  let t13 = lap("  linear v_proj", t12)
+
+  let q_normed = q3.per_head_rms_norm(q_proj, q_norm_gamma, n_q_heads, eps)
+  let t14 = lap("  per_head_rms_norm Q (16 heads)", t13)
+  let k_normed = q3.per_head_rms_norm(k_proj, k_norm_gamma, n_kv_heads, eps)
+  let t15 = lap("  per_head_rms_norm K (8 heads)", t14)
+
+  let q_rot = q3.rope_rotate(q_normed, n_q_heads, head_dim, rope_theta)
+  let t16 = lap("  rope_rotate Q", t15)
+  let k_rot = q3.rope_rotate(k_normed, n_kv_heads, head_dim, rope_theta)
+  let t17 = lap("  rope_rotate K", t16)
+
+  let k_full = q3.repeat_kv(k_rot, n_kv_heads, 2)
+  let t18 = lap("  repeat_kv K", t17)
+  let v_full = q3.repeat_kv(v_proj, n_kv_heads, 2)
+  let t19 = lap("  repeat_kv V", t18)
+
+  let attn_out = matrix.masked_multi_head_attention(q_rot, k_full, v_full, n_q_heads)
+  let t20 = lap("  masked_multi_head_attention", t19)
+  let attn_proj = matrix.linear_row_no_bias(attn_out, w_o)
+  let t21 = lap("  linear attn output", t20)
+  let x_attn = matrix.add(x, attn_proj)
+  let t22 = lap("  residual add", t21)
+
+  let h2 = matrix.rms_norm_rows(x_attn, ffn_norm_gamma, eps)
+  let t23 = lap("  rms_norm_rows (pre-ffn)", t22)
+  let gated = matrix.swiglu_gate(h2, w_gate, w_up)
+  let t24 = lap("  swiglu_gate", t23)
+  let ffn_out = matrix.linear_row_no_bias(gated, w_down)
+  let t25 = lap("  linear ffn_down", t24)
+  let out = matrix.add(x_attn, ffn_out)
+  let _t26 = lap("  final residual add", t25)
+
+  let (rows, cols) = matrix.shape(out)
+  println("output: " + int.to_string(rows) + "x" + int.to_string(cols))
+}

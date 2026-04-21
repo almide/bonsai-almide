@@ -1,0 +1,23 @@
+// probe_timed — split timing for GGUF load vs Q1_0 decode.
+
+import nn.gguf as gguf
+import datetime
+
+effect fn main() -> Unit = {
+  let t0 = datetime.monotonic_ns()
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+  let t1 = datetime.monotonic_ns()
+  println("GGUF load: " + int.to_string((t1 - t0) / 1000000) + " ms_equiv")
+
+  match list.find(file.tensors, (t) => t.name == "blk.0.attn_k.weight") {
+    some(info) => {
+      let t2 = datetime.monotonic_ns()
+      let m = gguf.extract_q1_0_matrix(file, info)
+      let t3 = datetime.monotonic_ns()
+      println("extract_q1_0_matrix (2M weights): " + int.to_string((t3 - t2) / 1000000) + " ms_equiv")
+      let (r, c) = matrix.shape(m)
+      println("  shape: " + int.to_string(r) + "x" + int.to_string(c))
+    },
+    none => println("not found"),
+  }
+}
