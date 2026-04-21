@@ -9,3 +9,10 @@ weights/*.gguf
 .DS_Store
 *.rmeta
 .almide/
+
+# Local bench binaries + profile dumps (keep source .almd / .mjs / README)
+bench/bench_native_fast
+bench/bench_super*
+bench/*.dSYM/
+bench/*_prof.json
+bench/*_prof.syms.json

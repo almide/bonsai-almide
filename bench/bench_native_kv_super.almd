@@ -1,0 +1,171 @@
+// bench_native_kv_super — Almide ネイティブ tok/s 計測 (KV + super-intrinsic).
+//
+// Almide 側の layer loop を 1 呼び出し (matrix.qwen3_block_q1_0_kv)
+// にまとめて、List[Matrix] の list.set / list.take オーバーヘッドを
+// 削る。Rust runtime 内で既存 matrix primitive を直接 chain 呼び。
+
+import nn.gguf as gguf
+import datetime
+
+fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
+  match list.find(file.tensors, (t) => t.name == name) {
+    some(t) => ok(t),
+    none => err("tensor not found: " + name),
+  }
+
+fn block_tensor_name(layer: Int, suffix: String) -> String =
+  "blk." + int.to_string(layer) + "." + suffix
+
+// Pure helper that takes only `tensors` + `base` so the caller avoids
+// cloning the whole GGUFFile (248 MB raw bytes) on every layer —
+// matches the pattern in memory/feedback_almide_bytes_clone.md.
+fn tensor_offset(tensors: List[gguf.TensorInfo], name: String, base: Int) -> Result[Int, String] =
+  match list.find(tensors, (t) => t.name == name) {
+    some(t) => ok(base + t.offset),
+    none => err("tensor not found: " + name),
+  }
+
+effect fn layer_offsets(
+  tensors: List[gguf.TensorInfo],
+  base: Int,
+  layer: Int,
+) -> Result[(List[Int], List[Int]), String] = {
+  let gamma_offs = [
+    tensor_offset(tensors, block_tensor_name(layer, "attn_norm.weight"), base)!,
+    tensor_offset(tensors, block_tensor_name(layer, "attn_q_norm.weight"), base)!,
+    tensor_offset(tensors, block_tensor_name(layer, "attn_k_norm.weight"), base)!,
+    tensor_offset(tensors, block_tensor_name(layer, "ffn_norm.weight"), base)!,
+  ]
+  let weight_offs = [
+    tensor_offset(tensors, block_tensor_name(layer, "attn_q.weight"), base)!,
+    tensor_offset(tensors, block_tensor_name(layer, "attn_k.weight"), base)!,
+    tensor_offset(tensors, block_tensor_name(layer, "attn_v.weight"), base)!,
+    tensor_offset(tensors, block_tensor_name(layer, "attn_output.weight"), base)!,
+    tensor_offset(tensors, block_tensor_name(layer, "ffn_gate.weight"), base)!,
+    tensor_offset(tensors, block_tensor_name(layer, "ffn_up.weight"), base)!,
+    tensor_offset(tensors, block_tensor_name(layer, "ffn_down.weight"), base)!,
+  ]
+  ok((gamma_offs, weight_offs))
+}
+
+effect fn predict_next_kv(
+  file: gguf.GGUFFile,
+  kv_keys: List[Matrix],
+  kv_values: List[Matrix],
+  new_tokens: List[Int],
+  start_pos: Int,
+) -> Result[(Int, List[Matrix], List[Matrix]), String] = {
+  let n_q_heads = 16
+  let n_kv_heads = 8
+  let head_dim = 128
+  let ffn_hidden = 6144
+  let rope_theta = 1000000.0
+  let eps = 0.000001
+  let n_layers = 28
+  let hidden = n_q_heads * head_dim
+  let kv_hidden = n_kv_heads * head_dim
+  // Pull everything we need off `file` once so the layer loop doesn't
+  // trigger repeated GGUFFile clones (profile showed 72% time here).
+  let raw = file.raw
+  let base = file.data_offset
+  let tensors = file.tensors
+
+  let embd_info = find_tensor(file, "token_embd.weight")!
+  let embd_cols = list.get(embd_info.dims, 0) |> option.unwrap_or(hidden)
+  let embd_offset = base + embd_info.offset
+
+  var h = matrix.select_rows_q1_0(raw, embd_offset, embd_cols, new_tokens)
+  var new_keys = list.take(kv_keys, list.len(kv_keys))
+  var new_values = list.take(kv_values, list.len(kv_values))
+
+  for layer in 0..n_layers {
+    let k_cache = list.get(new_keys, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
+    let v_cache = list.get(new_values, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
+    let (gamma_offs, weight_offs) = layer_offsets(tensors, base, layer)!
+    let (h_next, k_new, v_new) = matrix.qwen3_block_q1_0_kv(
+      h, k_cache, v_cache, raw, gamma_offs, weight_offs,
+      start_pos, n_q_heads, n_kv_heads, head_dim, ffn_hidden, rope_theta, eps,
+    )
+    h = h_next
+    new_keys = list.set(new_keys, layer, k_new)
+    new_values = list.set(new_values, layer, v_new)
+  }
+
+  let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
+  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
+  let vocab = list.get(embd_info.dims, 1) |> option.unwrap_or(1)
+  let logits = matrix.linear_q1_0_row_no_bias(normed, raw, embd_offset, vocab, embd_cols)
+
+  let (lr, _lc) = matrix.shape(logits)
+  let last_row = matrix.to_lists(logits) |> list.get(lr - 1) |> option.unwrap_or([])
+  let (best_id, _best_v) = last_row
+    |> list.enumerate
+    |> list.fold((0, -1000000000.0), (acc, entry) => {
+      let (bi, bv) = acc
+      let (i, v) = entry
+      if v > bv then (i, v) else (bi, bv)
+    })
+  ok((best_id, new_keys, new_values))
+}
+
+effect fn step(
+  file: gguf.GGUFFile,
+  keys: List[Matrix],
+  values: List[Matrix],
+  new_tokens: List[Int],
+  start_pos: Int,
+) -> Result[(Int, List[Matrix], List[Matrix]), String] =
+  predict_next_kv(file, keys, values, new_tokens, start_pos)
+
+effect fn main() -> Result[Unit, String] = {
+  let n_gen = 8
+  let n_layers = 28
+  let kv_hidden = 8 * 128
+
+  println("# bench_native_kv_super — Bonsai-1.7B-Q1_0 native (release, KV, super-intrinsic)")
+
+  let t_load0 = datetime.monotonic_ns()
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+  let t_load1 = datetime.monotonic_ns()
+  println("GGUF load: " + int.to_string((t_load1 - t_load0) / 1000000) + " ms")
+
+  var keys: List[Matrix] = []
+  var values: List[Matrix] = []
+  for _ in 0..n_layers {
+    list.push(keys, matrix.zeros(0, kv_hidden))
+    list.push(values, matrix.zeros(0, kv_hidden))
+  }
+
+  let prompt = [785, 6722, 315, 6323, 374]
+  let prompt_len = list.len(prompt)
+
+  let t_pp0 = datetime.monotonic_ns()
+  let (first, k1, v1) = step(file, keys, values, prompt, 0)!
+  let t_pp1 = datetime.monotonic_ns()
+  let pp_ms = (t_pp1 - t_pp0) / 1000000
+  keys = k1
+  values = v1
+  println("prompt_eval (" + int.to_string(prompt_len) + " tok): " + int.to_string(pp_ms) + " ms")
+  println("  first next-tok id: " + int.to_string(first))
+
+  var last = first
+  var pos = prompt_len
+  let t_g0 = datetime.monotonic_ns()
+  for _ in 0..(n_gen - 1) {
+    let (next, k_upd, v_upd) = step(file, keys, values, [last], pos)!
+    keys = k_upd
+    values = v_upd
+    last = next
+    pos = pos + 1
+  }
+  let t_g1 = datetime.monotonic_ns()
+  let g_ms = (t_g1 - t_g0) / 1000000
+  let total_gen_ms = pp_ms + g_ms
+  println("gen " + int.to_string(n_gen) + " tokens total: " + int.to_string(total_gen_ms) + " ms")
+  println("  avg per-token (incl prompt eval): " + int.to_string(total_gen_ms / n_gen) + " ms")
+  let tg_avg_ms = g_ms / (n_gen - 1)
+  println("  tg-only avg: " + int.to_string(tg_avg_ms) + " ms/tok")
+  let tok_per_s = if tg_avg_ms > 0 then 1000 / tg_avg_ms else 0
+  println("  tg tok/s: " + int.to_string(tok_per_s))
+  ok(())
+}

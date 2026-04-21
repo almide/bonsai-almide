@@ -1,0 +1,151 @@
+// bench_native — Almide ネイティブ tok/s 計測.
+//
+// 入力: weights/Bonsai-1.7B-Q1_0.gguf
+// プロンプト: "The capital of Japan is" → [785, 6722, 315, 6323, 374]
+// 出力: prompt-eval time, gen tok/s over N_GEN ステップ
+
+import nn.gguf as gguf
+import nn.qwen3 as q3
+import datetime
+
+fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
+  match list.find(file.tensors, (t) => t.name == name) {
+    some(t) => ok(t),
+    none => err("tensor not found: " + name),
+  }
+
+fn block_tensor_name(layer: Int, suffix: String) -> String =
+  "blk." + int.to_string(layer) + "." + suffix
+
+effect fn run_layer_q1_0(
+  file: gguf.GGUFFile,
+  h: Matrix,
+  layer: Int,
+  n_q_heads: Int, n_kv_heads: Int, head_dim: Int,
+  ffn_hidden: Int,
+  rope_theta: Float, eps: Float,
+) -> Result[Matrix, String] = {
+  let hidden = n_q_heads * head_dim
+  let kv_hidden = n_kv_heads * head_dim
+  let n_rep = n_q_heads / n_kv_heads
+
+  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!)
+  let q_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!)
+  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!)
+  let ffn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!)
+
+  let wq_info = find_tensor(file, block_tensor_name(layer, "attn_q.weight"))!
+  let wk_info = find_tensor(file, block_tensor_name(layer, "attn_k.weight"))!
+  let wv_info = find_tensor(file, block_tensor_name(layer, "attn_v.weight"))!
+  let wo_info = find_tensor(file, block_tensor_name(layer, "attn_output.weight"))!
+  let wgate_info = find_tensor(file, block_tensor_name(layer, "ffn_gate.weight"))!
+  let wup_info = find_tensor(file, block_tensor_name(layer, "ffn_up.weight"))!
+  let wdown_info = find_tensor(file, block_tensor_name(layer, "ffn_down.weight"))!
+
+  let base = file.data_offset
+  let raw = file.raw
+
+  let h_normed = matrix.rms_norm_rows(h, attn_norm_gamma, eps)
+  let q_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wq_info.offset, hidden, hidden)
+  let k_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wk_info.offset, kv_hidden, hidden)
+  let v_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wv_info.offset, kv_hidden, hidden)
+
+  let q_normed = q3.per_head_rms_norm(q_proj, q_norm_gamma, n_q_heads, eps)
+  let k_normed = q3.per_head_rms_norm(k_proj, k_norm_gamma, n_kv_heads, eps)
+
+  let q_rot = q3.rope_rotate(q_normed, n_q_heads, head_dim, rope_theta)
+  let k_rot = q3.rope_rotate(k_normed, n_kv_heads, head_dim, rope_theta)
+
+  let k_full = q3.repeat_kv(k_rot, n_kv_heads, n_rep)
+  let v_full = q3.repeat_kv(v_proj, n_kv_heads, n_rep)
+
+  let attn_out = matrix.masked_multi_head_attention(q_rot, k_full, v_full, n_q_heads)
+  let attn_proj = matrix.linear_q1_0_row_no_bias(attn_out, raw, base + wo_info.offset, hidden, hidden)
+  let x_attn = matrix.add(h, attn_proj)
+
+  let h2 = matrix.rms_norm_rows(x_attn, ffn_norm_gamma, eps)
+  let gate = matrix.linear_q1_0_row_no_bias(h2, raw, base + wgate_info.offset, ffn_hidden, hidden)
+  let up = matrix.linear_q1_0_row_no_bias(h2, raw, base + wup_info.offset, ffn_hidden, hidden)
+  let gated = matrix.silu_mul(gate, up)
+  let ffn_out = matrix.linear_q1_0_row_no_bias(gated, raw, base + wdown_info.offset, hidden, ffn_hidden)
+  ok(matrix.add(x_attn, ffn_out))
+}
+
+effect fn predict_next(file: gguf.GGUFFile, tokens: List[Int]) -> Result[Int, String] = {
+  let n_q_heads = 16
+  let n_kv_heads = 8
+  let head_dim = 128
+  let ffn_hidden = 6144
+  let rope_theta = 1000000.0
+  let eps = 0.000001
+  let n_layers = 28
+  let hidden = n_q_heads * head_dim
+
+  let embd_info = find_tensor(file, "token_embd.weight")!
+  let embd_cols = list.get(embd_info.dims, 0) |> option.unwrap_or(hidden)
+  let embd_offset = file.data_offset + embd_info.offset
+  var h = matrix.select_rows_q1_0(file.raw, embd_offset, embd_cols, tokens)
+
+  for layer in 0..n_layers {
+    h = run_layer_q1_0(file, h, layer,
+      n_q_heads, n_kv_heads, head_dim, ffn_hidden, rope_theta, eps)!
+  }
+
+  let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
+  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
+  let vocab = list.get(embd_info.dims, 1) |> option.unwrap_or(1)
+  let logits = matrix.linear_q1_0_row_no_bias(normed, file.raw, embd_offset, vocab, embd_cols)
+
+  let (lr, _lc) = matrix.shape(logits)
+  let last_row = matrix.to_lists(logits) |> list.get(lr - 1) |> option.unwrap_or([])
+  let (best_id, _best_v) = last_row
+    |> list.enumerate
+    |> list.fold((0, -1000000000.0), (acc, entry) => {
+      let (bi, bv) = acc
+      let (i, v) = entry
+      if v > bv then (i, v) else (bi, bv)
+    })
+  ok(best_id)
+}
+
+effect fn step(file: gguf.GGUFFile, tokens: List[Int]) -> Result[Int, String] =
+  predict_next(file, tokens)
+
+effect fn main() -> Result[Unit, String] = {
+  let n_gen = 8
+
+  println("# bench_native — Bonsai-1.7B-Q1_0 on Almide native (release)")
+
+  let t_load0 = datetime.monotonic_ns()
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+  let t_load1 = datetime.monotonic_ns()
+  println("GGUF load: " + int.to_string((t_load1 - t_load0) / 1000000) + " ms")
+
+  var ctx = [785, 6722, 315, 6323, 374]
+  let prompt_len = list.len(ctx)
+
+  let t_pp0 = datetime.monotonic_ns()
+  let first = step(file, ctx)!
+  let t_pp1 = datetime.monotonic_ns()
+  let pp_ms = (t_pp1 - t_pp0) / 1000000
+  println("prompt_eval (" + int.to_string(prompt_len) + " tok): " + int.to_string(pp_ms) + " ms")
+  println("  first next-tok id: " + int.to_string(first))
+
+  list.push(ctx, first)
+
+  let t_g0 = datetime.monotonic_ns()
+  for _ in 0..(n_gen - 1) {
+    let next = step(file, ctx)!
+    list.push(ctx, next)
+  }
+  let t_g1 = datetime.monotonic_ns()
+  let g_ms = (t_g1 - t_g0) / 1000000
+  let total_gen_ms = pp_ms + g_ms
+  println("gen " + int.to_string(n_gen) + " tokens total: " + int.to_string(total_gen_ms) + " ms")
+  println("  avg per-token (incl prompt eval): " + int.to_string(total_gen_ms / n_gen) + " ms")
+  let tg_avg_ms = g_ms / (n_gen - 1)
+  println("  tg-only avg: " + int.to_string(tg_avg_ms) + " ms/tok")
+  let tok_per_s = if tg_avg_ms > 0 then 1000 / tg_avg_ms else 0
+  println("  tg tok/s: " + int.to_string(tok_per_s))
+  ok(())
+}
