@@ -17,9 +17,10 @@
   .ok { color: #282; }
   .row { margin: 0.4em 0; }
   textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 0.6em; }
-  .chat { border: 1px solid #ddd; padding: 0.8em; border-radius: 6px; min-height: 60px; background: #fbfbfd; font-size: 15px; line-height: 1.6; white-space: pre-wrap; }
-  .chat .user { color: #333; }
-  .chat .ai { color: #145; background: #eef3fa; padding: 0.2em 0.4em; border-radius: 3px; }
+  .chat { border: 1px solid #ddd; padding: 0.8em; border-radius: 6px; min-height: 60px; background: #fbfbfd; font-size: 15px; line-height: 1.6; }
+  .chat .user { color: #333; margin-bottom: 0.6em; white-space: pre-wrap; }
+  .chat .ai { color: #145; background: #eef3fa; padding: 0.4em 0.6em; border-radius: 3px; white-space: pre-wrap; }
+  .chat b { color: #555; }
   .progress { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; margin: 0.4em 0; }
   .progress > div { height: 100%; background: #4a9; width: 0%; transition: width 0.2s; }
   .footer { color: #888; font-size: 0.85em; margin-top: 1em; }
@@ -38,11 +39,14 @@
 <fieldset>
   <legend>Chat</legend>
   <div class="row">
-    <textarea id="promptInput" rows="2" placeholder="Type a prompt, e.g. 'The capital of Japan is'">The capital of Japan is</textarea>
+    <label>System: <input id="systemInput" type="text" style="width: 100%; box-sizing: border-box" value="You are a helpful assistant." /></label>
+  </div>
+  <div class="row">
+    <textarea id="promptInput" rows="2" placeholder="Type a message, e.g. 'Hello' or 'What is the capital of Japan?'">What is the capital of Japan?</textarea>
   </div>
   <div class="row">
     Max new tokens:
-    <input id="maxNew" type="number" value="20" min="1" max="60" style="width: 4em" />
+    <input id="maxNew" type="number" value="80" min="1" max="256" style="width: 5em" />
     Temp:
     <input id="temperature" type="number" value="0.8" min="0" max="2" step="0.1" style="width: 4em" />
     Top-k:
@@ -63,14 +67,15 @@
 </details>
 
 <p class="footer">
-  Streaming KV cache: first call does full prompt eval (~10 s for a 5-token prompt), then each
-  generated token is one attention step over the cached K/V (<code>predict_step_kv_bytes</code>).
-  KV state round-trips through <code>List[Bytes]</code> between steps so the WASM bump allocator
-  stays flat — JS copies the caches out, <code>__heap_restore</code>s the scratch, and feeds them
-  back in. Sampling (temperature + top-k) happens inside Almide: JS supplies a PRNG-derived
-  <code>rand01</code> each step. Greedy = <code>temp 0</code> or <code>top-k 1</code>.
-  Each weight matrix stays packed in Q1_0 throughout via
-  <code>matrix.linear_q1_0_row_no_bias</code>. Model is cached in IndexedDB on first run.
+  Chat: Qwen3 chat template is applied (<code>tokenizer.apply_chat_template</code> → ChatML with
+  <code>&lt;|im_start|&gt;</code> markers) so base Bonsai behaves as an assistant. Streams with
+  KV cache: first call does full prompt eval, then each generated token is one attention step
+  over cached K/V (<code>predict_step_kv_bytes</code>). KV state round-trips through
+  <code>List[Bytes]</code> between steps — JS copies caches out, <code>__heap_restore</code>s
+  scratch, feeds them back. Sampling (temperature + top-k + repetition penalty) inside Almide;
+  JS supplies PRNG-derived <code>rand01</code>. Generation stops on
+  <code>&lt;|im_end|&gt;</code>. Weights stay packed in Q1_0 via
+  <code>matrix.linear_q1_0_row_no_bias</code>. Model cached in IndexedDB on first run.
 </p>
 
 <script type="module">
@@ -78,6 +83,9 @@ import { makeWasi } from './wasi_shim.js';
 import { AutoTokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/+esm';
 
 const $ = (id) => document.getElementById(id);
+const escapeHtml = (s) => s
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 const logEl = $('log');
 const log = (msg) => { logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight; };
 const bootStatus = (msg, cls) => { const el = $('bootStatus'); el.textContent = msg; el.className = 'status' + (cls ? ' ' + cls : ''); };
@@ -304,8 +312,9 @@ async function boot() {
 $('sendBtn').addEventListener('click', async () => {
   if (!modelPtr || !tokenizer) return;
   $('sendBtn').disabled = true;
-  const prompt = $('promptInput').value;
-  const nNew = Math.min(60, Math.max(1, parseInt($('maxNew').value, 10)));
+  const systemMsg = $('systemInput').value || 'You are a helpful assistant.';
+  const userMsg = $('promptInput').value;
+  const nNew = Math.min(256, Math.max(1, parseInt($('maxNew').value, 10)));
   const temperature = Math.max(0, Math.min(2, parseFloat($('temperature').value)));
   const topK = Math.max(1, Math.min(200, parseInt($('topK').value, 10)));
   const repeatPenalty = Math.max(1.0, Math.min(2.0, parseFloat($('penalty').value)));
@@ -322,14 +331,29 @@ $('sendBtn').addEventListener('click', async () => {
   };
   const chatEl = $('chat');
   try {
-    runStatus('tokenising prompt…');
-    const encoded = await tokenizer(prompt, { add_special_tokens: false });
-    const tokens = Array.from(encoded.input_ids.data, (n) => Number(n));
+    runStatus('applying chat template…');
+    const messages = [
+      { role: 'system', content: systemMsg },
+      { role: 'user', content: userMsg },
+    ];
+    // apply_chat_template wraps messages in Qwen3's <|im_start|>role\n...<|im_end|>
+    // markers and adds <|im_start|>assistant\n so the model continues as assistant.
+    const encoded = tokenizer.apply_chat_template(messages, {
+      add_generation_prompt: true,
+      tokenize: true,
+      return_tensor: false,
+    });
+    const tokens = encoded.input_ids.map((n) => Number(n));
     log('prompt tokens (' + tokens.length + '): ' + tokens.join(', '));
     log(`sampling: temperature=${temperature} top_k=${topK} penalty=${repeatPenalty} seed=${seedStart}`);
 
-    chatEl.innerHTML = '<span class="user">' + prompt + '</span><span class="ai"></span>';
-    const aiEl = chatEl.querySelector('.ai');
+    chatEl.innerHTML =
+      '<div class="user"><b>You:</b> ' + escapeHtml(userMsg) + '</div>' +
+      '<div class="ai"><b>Assistant:</b> <span class="ai-text"></span></div>';
+    const aiEl = chatEl.querySelector('.ai-text');
+
+    // Qwen3 end-of-turn / end-of-text tokens — stop streaming when seen.
+    const EOS_TOKENS = new Set([151643, 151645]);
 
     const {
       __heap_save, __heap_restore,
@@ -354,8 +378,12 @@ $('sendBtn').addEventListener('click', async () => {
     const promptElapsed = performance.now() - t0;
     __heap_restore(sessionMark);
 
+    if (EOS_TOKENS.has(firstTok)) {
+      runStatus(`done — assistant replied with 0 tokens (${(promptElapsed / 1000).toFixed(1)}s prompt eval).`, 'ok');
+      return;
+    }
     const generated = [firstTok];
-    aiEl.textContent = tokenizer.decode(generated, { skip_special_tokens: false });
+    aiEl.textContent = tokenizer.decode(generated, { skip_special_tokens: true });
     const bytesPerLayer = keys0[0] ? keys0[0].length : 0;
     log(`  prompt eval: next tok ${firstTok} in ${(promptElapsed / 1000).toFixed(1)}s (${keys0.length} layers × ${bytesPerLayer} B/layer = ${(keys0.length * bytesPerLayer / 1024 / 1024).toFixed(2)} MB kv)`);
 
@@ -399,8 +427,12 @@ $('sendBtn').addEventListener('click', async () => {
       pos += 1;
       generated.push(next);
       recentHistory.push(next);
-      aiEl.textContent = tokenizer.decode(generated, { skip_special_tokens: false });
+      aiEl.textContent = tokenizer.decode(generated, { skip_special_tokens: true });
       log(`  step ${step}: token ${next} → ${JSON.stringify(tokenizer.decode([next]))} in ${(elapsed / 1000).toFixed(1)}s`);
+      if (EOS_TOKENS.has(next)) {
+        log('  hit EOS, stopping early');
+        break;
+      }
     }
     runStatus(`done — ${generated.length} tokens in ${(totalElapsed / 1000).toFixed(1)}s total (${(totalElapsed / generated.length / 1000).toFixed(1)}s / token).`, 'ok');
   } catch (err) {

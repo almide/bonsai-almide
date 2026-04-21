@@ -107,7 +107,20 @@ async function main() {
   console.log(`model write: ${(t_write1 - t_write0).toFixed(0)} ms`);
 
   const sessionMark = (__heap_save() >>> 0);
-  const prompt = [785, 6722, 315, 6323, 374];
+  let prompt = [785, 6722, 315, 6323, 374];
+  if (process.env.CHAT === '1') {
+    const { AutoTokenizer } = await import('@huggingface/transformers');
+    const tok = await AutoTokenizer.from_pretrained('Qwen/Qwen3-1.7B');
+    const messages = [
+      { role: 'system', content: 'You are a helpful assistant.' },
+      { role: 'user', content: process.env.USER_MSG || 'What is the capital of Japan?' },
+    ];
+    const encoded = tok.apply_chat_template(messages, {
+      add_generation_prompt: true, tokenize: true, return_tensor: false,
+    });
+    prompt = encoded.input_ids.map((n) => Number(n));
+    console.log(`chat-template prompt (${prompt.length} tokens)`);
+  }
   const nGen = Number(process.env.N_GEN || 1);
   const temperature = Number(process.env.TEMP ?? 0.0);
   const topK = Number(process.env.TOP_K ?? 1);
