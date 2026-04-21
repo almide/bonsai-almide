@@ -1,0 +1,118 @@
+// Native L3 verification using the Q1_0 direct-matmul path (no weight
+// decoding). Should produce the same top token (26194 " Tokyo") as
+// probe_ref_match.almd and use a fraction of the memory — the whole
+// point of adding `matrix.linear_q1_0_row_no_bias`.
+
+import nn.gguf as gguf
+import nn.qwen3 as q3
+import datetime
+
+fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
+  match list.find(file.tensors, (t) => t.name == name) {
+    some(t) => ok(t),
+    none => err("not found: " + name),
+  }
+
+fn block_tensor_name(layer: Int, suffix: String) -> String =
+  "blk." + int.to_string(layer) + "." + suffix
+
+effect fn run_layer_q1_0(
+  file: gguf.GGUFFile,
+  h: Matrix,
+  layer: Int,
+  n_q_heads: Int, n_kv_heads: Int, head_dim: Int,
+  ffn_hidden: Int,
+  rope_theta: Float, eps: Float,
+) -> Result[Matrix, String] = {
+  let hidden = n_q_heads * head_dim
+  let kv_hidden = n_kv_heads * head_dim
+  let n_rep = n_q_heads / n_kv_heads
+
+  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!)
+  let q_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!)
+  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!)
+  let ffn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!)
+
+  let wq_info = find_tensor(file, block_tensor_name(layer, "attn_q.weight"))!
+  let wk_info = find_tensor(file, block_tensor_name(layer, "attn_k.weight"))!
+  let wv_info = find_tensor(file, block_tensor_name(layer, "attn_v.weight"))!
+  let wo_info = find_tensor(file, block_tensor_name(layer, "attn_output.weight"))!
+  let wgate_info = find_tensor(file, block_tensor_name(layer, "ffn_gate.weight"))!
+  let wup_info = find_tensor(file, block_tensor_name(layer, "ffn_up.weight"))!
+  let wdown_info = find_tensor(file, block_tensor_name(layer, "ffn_down.weight"))!
+
+  let base = file.data_offset
+  let raw = file.raw
+
+  let h_normed = matrix.rms_norm_rows(h, attn_norm_gamma, eps)
+  let q_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wq_info.offset, hidden, hidden)
+  let k_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wk_info.offset, kv_hidden, hidden)
+  let v_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wv_info.offset, kv_hidden, hidden)
+
+  let q_normed = q3.per_head_rms_norm(q_proj, q_norm_gamma, n_q_heads, eps)
+  let k_normed = q3.per_head_rms_norm(k_proj, k_norm_gamma, n_kv_heads, eps)
+  let q_rot = q3.rope_rotate(q_normed, n_q_heads, head_dim, rope_theta)
+  let k_rot = q3.rope_rotate(k_normed, n_kv_heads, head_dim, rope_theta)
+  let k_full = q3.repeat_kv(k_rot, n_kv_heads, n_rep)
+  let v_full = q3.repeat_kv(v_proj, n_kv_heads, n_rep)
+
+  let attn_out = matrix.masked_multi_head_attention(q_rot, k_full, v_full, n_q_heads)
+  let attn_proj = matrix.linear_q1_0_row_no_bias(attn_out, raw, base + wo_info.offset, hidden, hidden)
+  let x_attn = matrix.add(h, attn_proj)
+
+  let h2 = matrix.rms_norm_rows(x_attn, ffn_norm_gamma, eps)
+  let gate = matrix.linear_q1_0_row_no_bias(h2, raw, base + wgate_info.offset, ffn_hidden, hidden)
+  let up = matrix.linear_q1_0_row_no_bias(h2, raw, base + wup_info.offset, ffn_hidden, hidden)
+  let gated = matrix.silu_mul(gate, up)
+  let ffn_out = matrix.linear_q1_0_row_no_bias(gated, raw, base + wdown_info.offset, hidden, ffn_hidden)
+  ok(matrix.add(x_attn, ffn_out))
+}
+
+effect fn main() -> Unit = {
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+  let n_q_heads = 16
+  let n_kv_heads = 8
+  let head_dim = 128
+  let ffn_hidden = 6144
+  let rope_theta = 1000000.0
+  let eps = 0.000001
+  let n_layers = 28
+  let hidden = n_q_heads * head_dim
+
+  let tokens: List[Int] = [785, 6722, 315, 6323, 374]
+  println("prompt tokens (\"The capital of Japan is\"): "
+    + (tokens |> list.map((i) => int.to_string(i)) |> list.join(", ")))
+
+  let embd_info = find_tensor(file, "token_embd.weight")!
+  // Full decode is unavoidable until we add q1_0_select_rows; it's the
+  // single biggest allocation. Everything else stays packed.
+  let t_embd_start = datetime.monotonic_ns()
+  let token_embd = gguf.extract_q1_0_matrix(file, embd_info)
+  var h = matrix.select_rows(token_embd, tokens)
+  let t_embd_end = datetime.monotonic_ns()
+  println("embedding lookup: " + int.to_string((t_embd_end - t_embd_start) / 1000000) + " ms")
+
+  let t_fwd_start = datetime.monotonic_ns()
+  for layer in 0..n_layers {
+    h = run_layer_q1_0(file, h, layer, n_q_heads, n_kv_heads, head_dim, ffn_hidden, rope_theta, eps)!
+  }
+  let t_fwd_end = datetime.monotonic_ns()
+  println("28-layer forward (Q1_0 direct): " + int.to_string((t_fwd_end - t_fwd_start) / 1000000) + " ms")
+
+  let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
+  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
+  let vocab = list.get(embd_info.dims, 1) |> option.unwrap_or(1)
+  let logits = matrix.linear_q1_0_row_no_bias(normed, file.raw, file.data_offset + embd_info.offset, vocab, hidden)
+  let (lr, _lc) = matrix.shape(logits)
+  let last_row = matrix.to_lists(logits) |> list.get(lr - 1) |> option.unwrap_or([])
+  let (best_id, best_v) = last_row
+    |> list.enumerate
+    |> list.fold((0, -1000000000.0), (acc, entry) => {
+      let (bi, bv) = acc
+      let (i, v) = entry
+      if v > bv then (i, v) else (bi, bv)
+    })
+  println("top token: id=" + int.to_string(best_id) + " logit=" + float.to_string(best_v))
+  println("reference : id=26194 (\" Tokyo\")")
+  if best_id == 26194 then println("MATCH ✓") else println("MISMATCH")
+}

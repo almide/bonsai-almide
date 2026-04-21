@@ -1,0 +1,47 @@
+// Compare `linear_row_no_bias(x, decoded_weight)` vs
+// `linear_q1_0_row_no_bias(x, packed_bytes, ...)` on blk.0.attn_q.
+
+import nn.gguf as gguf
+
+fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
+  match list.find(file.tensors, (t) => t.name == name) {
+    some(t) => ok(t),
+    none => err("not found"),
+  }
+
+effect fn main() -> Unit = {
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+  let info = find_tensor(file, "blk.0.attn_q.weight")!
+
+  let cols = list.get(info.dims, 0) |> option.unwrap_or(1)
+  let rows = list.get(info.dims, 1) |> option.unwrap_or(1)
+  let offset = file.data_offset + info.offset
+  println("attn_q shape (out x in): " + int.to_string(rows) + " x " + int.to_string(cols))
+
+  // Input: [1, 2048] with a deterministic pattern.
+  let row_vals = list.range(0, cols) |> list.map((i) => int.to_float(i % 7) * 0.1 - 0.3)
+  let x = matrix.from_lists([row_vals])
+
+  // Path A: decode full matrix then linear.
+  let w = gguf.extract_q1_0_matrix(file, info)
+  let y_decode = matrix.linear_row_no_bias(x, w)
+
+  // Path B: direct Q1_0 matmul.
+  let y_direct = matrix.linear_q1_0_row_no_bias(x, file.raw, offset, rows, cols)
+
+  let a = matrix.to_lists(y_decode) |> list.get_or(0, [])
+  let b = matrix.to_lists(y_direct) |> list.get_or(0, [])
+
+  let first4_a = list.take(a, 4) |> list.map((v) => float.to_string(v)) |> list.join(", ")
+  let first4_b = list.take(b, 4) |> list.map((v) => float.to_string(v)) |> list.join(", ")
+  println("decode+linear first 4: " + first4_a)
+  println("direct q1_0    first 4: " + first4_b)
+
+  let diff = list.zip(a, b) |> list.map((p) => float.abs(p.0 - p.1))
+  let max_diff = diff |> list.fold(0.0, (m, d) => if d > m then d else m)
+  println("max abs diff: " + float.to_string(max_diff))
+  if max_diff < 1.0e-10 then
+    println("MATCH (Q1_0 direct matmul numerically identical to decode+linear)")
+  else
+    println("MISMATCH")
+}
