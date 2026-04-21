@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Bonsai × Almide — WASM demo</title>
+<style>
+  body { font: 14px/1.55 -apple-system, system-ui, sans-serif; max-width: 760px; margin: 2em auto; padding: 0 1em; color: #222; }
+  h1 { font-size: 1.4em; margin-bottom: 0.2em; }
+  .sub { color: #666; margin-top: 0; }
+  fieldset { border: 1px solid #ccc; padding: 1em; margin: 1em 0; }
+  legend { font-weight: bold; }
+  button { padding: 0.6em 1.2em; font-size: 1em; margin: 0.2em 0.4em 0.2em 0; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  pre { background: #f4f4f4; padding: 1em; white-space: pre-wrap; word-break: break-word; max-height: 280px; overflow: auto; font-size: 12px; }
+  .result { font-size: 1.15em; padding: 1em; background: #efe; border-left: 4px solid #4a4; margin: 1em 0; }
+  .status { color: #666; font-style: italic; margin: 0.4em 0; }
+  .error { color: #c33; }
+  .row { margin: 0.4em 0; }
+  .pill { display: inline-block; padding: 0.1em 0.6em; border-radius: 999px; background: #eef; color: #335; margin-right: 0.4em; font-size: 0.85em; }
+  table { border-collapse: collapse; font-size: 12px; }
+  td, th { padding: 0.2em 0.6em; border-bottom: 1px solid #eee; text-align: left; }
+  input[type=file] { width: 100%; }
+  input[type=text] { padding: 0.4em 0.6em; font-size: 1em; }
+</style>
+</head>
+<body>
+<h1>Bonsai × Almide — WASM demo</h1>
+<p class="sub">Bonsai 1-bit LLM (1.7B, Qwen3 arch) compiled from <a href="https://github.com/almide/almide">Almide</a> to WebAssembly.
+Pure Almide implementation — every primitive (GGUF parser, Q1_0 decoder, RoPE, GQA attention) comes from the language, not a JS ML framework.</p>
+
+<fieldset>
+  <legend>1. Load the Bonsai GGUF</legend>
+  <div class="row">Pick <code>Bonsai-1.7B-Q1_0.gguf</code> (248 MB) from Hugging Face
+    (<a href="https://huggingface.co/prism-ml/Bonsai-1.7B-gguf" target="_blank">prism-ml/Bonsai-1.7B-gguf</a>):<br>
+    <input id="fileInput" type="file" accept=".gguf" />
+  </div>
+  <div id="modelStatus" class="status">not loaded</div>
+</fieldset>
+
+<fieldset>
+  <legend>2. Verify parsing &amp; Q1_0 decode</legend>
+  <button id="parseBtn" disabled>Parse GGUF header</button>
+  <button id="decodeBtn" disabled>Decode blk.0.attn_k.weight</button>
+  <div id="parseResult" class="status">parse the header first</div>
+</fieldset>
+
+<fieldset>
+  <legend>3. Full next-token prediction (native only for now)</legend>
+  <p style="font-size: 0.9em;">
+    L3 numerical correctness has been verified on the <strong>native</strong> Rust target:
+    prompt <code>"The capital of Japan is"</code> (tokens <code>[785, 6722, 315, 6323, 374]</code>)
+    produces next-token id <strong>26194</strong> (" Tokyo") — byte-for-byte identical to
+    <code>llama.cpp</code> on the same GGUF.</p>
+  <p style="font-size: 0.9em;">
+    WASM path currently decodes individual tensors correctly; the 28-layer
+    forward pass is blocked on two more codegen items listed in
+    <a href="https://github.com/almide/bonsai-almide/blob/main/docs/WASM_ROADMAP.md">docs/WASM_ROADMAP.md</a>
+    (live Q1_0 matmul kernel + a memory-frugal <code>matrix.to_lists</code>).</p>
+  <button id="predictBtn" disabled>Attempt predict_next (may trap)</button>
+  <div id="predictResult" class="status">—</div>
+</fieldset>
+
+<div id="result"></div>
+
+<details open>
+  <summary>Logs</summary>
+  <pre id="log"></pre>
+</details>
+
+<script type="module">
+import { makeWasi } from './wasi_shim.js';
+
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+const log = (msg) => { logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight; };
+const modelStatus = (msg, cls) => { const el = $('modelStatus'); el.textContent = msg; el.className = 'status' + (cls ? ' ' + cls : ''); };
+const parseStatus = (html, cls) => { const el = $('parseResult'); el.innerHTML = html; el.className = (cls ? cls : 'status'); };
+const predictStatus = (msg, cls) => { const el = $('predictResult'); el.textContent = msg; el.className = 'status' + (cls ? ' ' + cls : ''); };
+
+let wasmInstance = null, wasmMemory = null, modelPtr = 0;
+
+function resultInt(ptr) {
+  const v = new DataView(wasmMemory.buffer);
+  const tag = v.getInt32(ptr >>> 0, true);
+  if (tag !== 0) {
+    const p = v.getInt32((ptr >>> 0) + 4, true) >>> 0;
+    const l = v.getInt32(p, true);
+    throw new Error('Almide err: ' + new TextDecoder().decode(new Uint8Array(wasmMemory.buffer, p + 4, l)));
+  }
+  return Number(v.getBigInt64((ptr >>> 0) + 4, true));
+}
+function resultFloat(ptr) {
+  const v = new DataView(wasmMemory.buffer);
+  const tag = v.getInt32(ptr >>> 0, true);
+  if (tag !== 0) {
+    const p = v.getInt32((ptr >>> 0) + 4, true) >>> 0;
+    const l = v.getInt32(p, true);
+    throw new Error('Almide err: ' + new TextDecoder().decode(new Uint8Array(wasmMemory.buffer, p + 4, l)));
+  }
+  return v.getFloat64((ptr >>> 0) + 4, true);
+}
+
+$('fileInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  try {
+    modelStatus('reading ' + (file.size / 1024 / 1024).toFixed(1) + ' MB…');
+    const modelBuf = new Uint8Array(await file.arrayBuffer());
+    log('file read: ' + modelBuf.length + ' bytes');
+
+    if (!wasmInstance) {
+      modelStatus('instantiating WASM…');
+      const wasmBuf = await (await fetch('./bonsai.wasm')).arrayBuffer();
+      const wasi = makeWasi({ stdout: (s) => log('[out] ' + s), stderr: (s) => log('[err] ' + s) });
+      const { instance } = await WebAssembly.instantiate(wasmBuf, wasi.imports);
+      wasi.setMemory(instance.exports.memory);
+      if (instance.exports._initialize) instance.exports._initialize();
+      wasmInstance = instance;
+      wasmMemory = instance.exports.memory;
+      log('WASM instantiated; exports: ' + Object.keys(instance.exports).join(', '));
+      log('health: ' + instance.exports.wasm_health_check());
+    }
+
+    modelStatus('writing model into WASM memory…');
+    const { __alloc } = wasmInstance.exports;
+    modelPtr = (__alloc(4 + modelBuf.length) >>> 0);
+    new DataView(wasmMemory.buffer).setInt32(modelPtr, modelBuf.length, true);
+    new Uint8Array(wasmMemory.buffer).set(modelBuf, modelPtr + 4);
+    log('model written at ptr=' + modelPtr);
+    modelStatus('ready (' + (modelBuf.length / 1024 / 1024).toFixed(1) + ' MB).');
+    $('parseBtn').disabled = false;
+    $('decodeBtn').disabled = false;
+    $('predictBtn').disabled = false;
+  } catch (err) {
+    modelStatus('error: ' + err.message, 'error');
+    log('ERROR: ' + (err.stack || err));
+  }
+});
+
+$('parseBtn').addEventListener('click', () => {
+  try {
+    const ex = wasmInstance.exports;
+    const version = resultInt(ex.header_version(modelPtr));
+    const tCount = resultInt(ex.header_tensor_count(modelPtr));
+    const mCount = resultInt(ex.header_metadata_count(modelPtr));
+    const parsed = resultInt(ex.tensor_count(modelPtr));
+    const [dNum, d0, d1] = (() => {
+      const rp = ex.token_embd_dims(modelPtr) >>> 0;
+      const v = new DataView(wasmMemory.buffer);
+      if (v.getInt32(rp, true) !== 0) throw new Error('token_embd_dims err');
+      const tup = v.getInt32(rp + 4, true) >>> 0;
+      return [Number(v.getBigInt64(tup, true)), Number(v.getBigInt64(tup + 8, true)), Number(v.getBigInt64(tup + 16, true))];
+    })();
+    parseStatus(`<table>
+      <tr><th>GGUF version</th><td>${version}</td></tr>
+      <tr><th>Tensor count (header)</th><td>${tCount}</td></tr>
+      <tr><th>Tensor count (parsed)</th><td>${parsed}</td></tr>
+      <tr><th>Metadata entries</th><td>${mCount}</td></tr>
+      <tr><th>token_embd.weight dims</th><td>[${d0}, ${d1}] (${dNum}D)</td></tr>
+    </table>
+    <p><span class="pill">GGUF parse: OK</span></p>`);
+    log('parsed GGUF; ' + parsed + ' tensors');
+  } catch (err) {
+    parseStatus('error: ' + err.message, 'error');
+    log('ERROR: ' + (err.stack || err));
+  }
+});
+
+$('decodeBtn').addEventListener('click', () => {
+  try {
+    const t0 = performance.now();
+    const val = resultFloat(wasmInstance.exports.extract_attn_k_first_value(modelPtr));
+    const elapsed = (performance.now() - t0).toFixed(0);
+    parseStatus(`<p><span class="pill">Q1_0 decode: OK</span></p>
+      <p>blk.0.attn_k.weight[0,0] = <b>${val}</b> &nbsp; (native reference: −0.031494140625)</p>
+      <p class="status">2 M weights decoded in ${elapsed} ms by pure-Almide WASM — fp16 scale + sign-bit unpack.</p>`);
+    log('decoded blk.0.attn_k[0,0] = ' + val + ' in ' + elapsed + ' ms');
+  } catch (err) {
+    parseStatus('error: ' + err.message, 'error');
+    log('ERROR: ' + (err.stack || err));
+  }
+});
+
+$('predictBtn').addEventListener('click', async () => {
+  $('predictBtn').disabled = true;
+  try {
+    predictStatus('running full predict_next (expected to trap on memory access for full forward) …');
+    await new Promise((r) => setTimeout(r, 30));
+    const tokens = [785n, 6722n, 315n, 6323n, 374n];
+    const { __alloc } = wasmInstance.exports;
+    const tp = __alloc(4 + tokens.length * 8) >>> 0;
+    const v = new DataView(wasmMemory.buffer);
+    v.setInt32(tp, tokens.length, true);
+    for (let i = 0; i < tokens.length; i++) v.setBigInt64(tp + 4 + i * 8, tokens[i], true);
+    const t0 = performance.now();
+    const resultPtr = wasmInstance.exports.predict_next(modelPtr, tp);
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+    const next = resultInt(resultPtr);
+    predictStatus('next token: ' + next + ' (reference: 26194 " Tokyo") in ' + elapsed + ' s');
+    $('result').innerHTML = `<div class="result">WASM predict_next → <b>${next}</b> (expected 26194) &nbsp;[${elapsed} s]</div>`;
+  } catch (err) {
+    predictStatus('trap: ' + err.message + ' — see WASM_ROADMAP.md for the two remaining codegen items', 'error');
+    log('predict_next trap: ' + err.message);
+  } finally {
+    $('predictBtn').disabled = false;
+  }
+});
+</script>
+</body>
+</html>

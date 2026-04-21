@@ -95,3 +95,105 @@ effect fn predict_next(model_bytes: Bytes, tokens: List[Int]) -> Result[Int, Str
 // Allow a host-callable smoke entry that doesn't require a model (useful
 // to verify the build + linkage before downloading 248 MB).
 fn wasm_health_check() -> Int = 42
+
+// Smoke test: parse the GGUF header and return the tensor count. Lets us
+// verify the parse path works in WASM before trying the full forward.
+effect fn tensor_count(model_bytes: Bytes) -> Result[Int, String] = {
+  let file = gguf.parse(model_bytes)!
+  ok(list.len(file.tensors))
+}
+
+// Debug: return the header's tensor_count field without parsing tensor infos.
+effect fn header_tensor_count(model_bytes: Bytes) -> Result[Int, String] = {
+  match gguf.parse_header(model_bytes) {
+    ok(r) => { let (header, _pos) = r; ok(header.tensor_count) },
+    err(e) => err(e),
+  }
+}
+
+// Even more primitive: return the first 4 bytes of the file as a packed
+// integer. For a valid GGUF file this should be 0x46554747 (LE "GGUF").
+fn first_u32(model_bytes: Bytes) -> Int = {
+  let b0 = bytes.get(model_bytes, 0) |> option.unwrap_or(0)
+  let b1 = bytes.get(model_bytes, 1) |> option.unwrap_or(0)
+  let b2 = bytes.get(model_bytes, 2) |> option.unwrap_or(0)
+  let b3 = bytes.get(model_bytes, 3) |> option.unwrap_or(0)
+  b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
+fn first_byte(model_bytes: Bytes) -> Int =
+  bytes.get(model_bytes, 0) |> option.unwrap_or(99)
+
+// Offset 8 is the start of tensor_count (u64 LE) in a GGUF v3 header.
+// Expected value: 310 for Bonsai-1.7B (0x136).
+fn raw_u32_at(model_bytes: Bytes, pos: Int) -> Int = {
+  let b0 = bytes.get(model_bytes, pos) |> option.unwrap_or(0)
+  let b1 = bytes.get(model_bytes, pos + 1) |> option.unwrap_or(0)
+  let b2 = bytes.get(model_bytes, pos + 2) |> option.unwrap_or(0)
+  let b3 = bytes.get(model_bytes, pos + 3) |> option.unwrap_or(0)
+  b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
+// All three header fields in one call to check which offset Almide places
+// each record field at.
+effect fn header_fields(model_bytes: Bytes) -> Result[(Int, Int, Int), String] = {
+  match gguf.parse_header(model_bytes) {
+    ok(r) => {
+      let (header, _pos) = r
+      ok((header.version, header.tensor_count, header.metadata_count))
+    },
+    err(e) => err(e),
+  }
+}
+
+effect fn header_version(model_bytes: Bytes) -> Result[Int, String] =
+  match gguf.parse_header(model_bytes) {
+    ok(r) => { let (header, _p) = r; ok(header.version) },
+    err(e) => err(e),
+  }
+
+effect fn header_metadata_count(model_bytes: Bytes) -> Result[Int, String] =
+  match gguf.parse_header(model_bytes) {
+    ok(r) => { let (header, _p) = r; ok(header.metadata_count) },
+    err(e) => err(e),
+  }
+
+// Extract one small Q1_0 tensor (blk.0.attn_k.weight, 2M weights, ~16 MB
+// output Matrix) to verify the intrinsic runs in WASM without touching
+// the 2.5 GB token_embd.
+effect fn extract_attn_k_first_value(model_bytes: Bytes) -> Result[Float, String] = {
+  let file = gguf.parse(model_bytes)!
+  match list.find(file.tensors, (t) => t.name == "blk.0.attn_k.weight") {
+    some(info) => {
+      let m = gguf.extract_q1_0_matrix(file, info)
+      ok(matrix.get(m, 0, 0))
+    },
+    none => err("blk.0.attn_k.weight not found"),
+  }
+}
+
+// Debug: return token_embd's dims stacked into a Result[(Int, Int, Int), String].
+// Expected: (dim_count, dims[0], dims[1]) = (2, 2048, 151669).
+effect fn token_embd_dims(model_bytes: Bytes) -> Result[(Int, Int, Int), String] = {
+  let file = gguf.parse(model_bytes)!
+  match list.find(file.tensors, (t) => t.name == "token_embd.weight") {
+    some(info) => {
+      let d0 = list.get(info.dims, 0) |> option.unwrap_or(-1)
+      let d1 = list.get(info.dims, 1) |> option.unwrap_or(-1)
+      ok((list.len(info.dims), d0, d1))
+    },
+    none => err("token_embd not found"),
+  }
+}
+
+// Extract token_embd (the 2.5 GB monster) and return the first value.
+effect fn extract_token_embd_first(model_bytes: Bytes) -> Result[Float, String] = {
+  let file = gguf.parse(model_bytes)!
+  match list.find(file.tensors, (t) => t.name == "token_embd.weight") {
+    some(info) => {
+      let m = gguf.extract_q1_0_matrix(file, info)
+      ok(matrix.get(m, 0, 0))
+    },
+    none => err("token_embd not found"),
+  }
+}
