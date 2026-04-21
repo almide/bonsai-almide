@@ -338,12 +338,27 @@ $('sendBtn').addEventListener('click', async () => {
     ];
     // apply_chat_template wraps messages in Qwen3's <|im_start|>role\n...<|im_end|>
     // markers and adds <|im_start|>assistant\n so the model continues as assistant.
+    // Return shape differs across transformers.js versions:
+    //  - v3: plain number[] (tokenize:true, return_tensor:false)
+    //  - v4: { input_ids: number[] } (tokenize:true, return_tensor:false)
+    //  - both, if return_tensor not honored: Tensor with .data
     const encoded = tokenizer.apply_chat_template(messages, {
       add_generation_prompt: true,
       tokenize: true,
       return_tensor: false,
     });
-    const tokens = encoded.input_ids.map((n) => Number(n));
+    let tokens;
+    if (Array.isArray(encoded)) {
+      tokens = encoded.map((n) => Number(n));
+    } else if (encoded && Array.isArray(encoded.input_ids)) {
+      tokens = encoded.input_ids.map((n) => Number(n));
+    } else if (encoded?.input_ids?.data) {
+      tokens = Array.from(encoded.input_ids.data, (n) => Number(n));
+    } else if (encoded?.data) {
+      tokens = Array.from(encoded.data, (n) => Number(n));
+    } else {
+      throw new Error('apply_chat_template returned unexpected shape: ' + String(encoded));
+    }
     log('prompt tokens (' + tokens.length + '): ' + tokens.join(', '));
     log(`sampling: temperature=${temperature} top_k=${topK} penalty=${repeatPenalty} seed=${seedStart}`);
 
