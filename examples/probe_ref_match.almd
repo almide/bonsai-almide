@@ -1,0 +1,119 @@
+// probe_ref_match — L3 numerical correctness.
+//
+// Prompt: "The capital of Japan is" — Qwen3 tokenizes to
+// [785, 6722, 315, 6323, 374]. The reference (Mintplex llama-cli on
+// Bonsai-1.7B-Q1_0) next-token is 26194 (" Tokyo").
+//
+// This probe: embed those 5 tokens via token_embd, run all 28 Qwen3
+// layers, apply output_norm, project through tied lm_head, and
+// argmax on the last row's logits. If Almide is numerically matched
+// to llama.cpp, we should see 26194 come out top.
+
+import nn.gguf as gguf
+import nn.qwen3 as q3
+import datetime
+
+fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
+  match list.find(file.tensors, (t) => t.name == name) {
+    some(t) => ok(t),
+    none => err("not found: " + name),
+  }
+
+fn block_tensor_name(layer: Int, suffix: String) -> String =
+  "blk." + int.to_string(layer) + "." + suffix
+
+effect fn run_layer(
+  file: gguf.GGUFFile,
+  h: Matrix,
+  layer: Int,
+  n_q_heads: Int, n_kv_heads: Int, head_dim: Int,
+  rope_theta: Float, eps: Float,
+) -> Result[Matrix, String] = {
+  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!)
+  let q_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!)
+  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!)
+  let ffn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!)
+  let w_q = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_q.weight"))!)
+  let w_k = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_k.weight"))!)
+  let w_v = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_v.weight"))!)
+  let w_o = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_output.weight"))!)
+  let w_gate = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_gate.weight"))!)
+  let w_up = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_up.weight"))!)
+  let w_down = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_down.weight"))!)
+  ok(q3.qwen3_block(
+    h,
+    attn_norm_gamma,
+    w_q, w_k, w_v, w_o,
+    q_norm_gamma, k_norm_gamma,
+    ffn_norm_gamma,
+    w_gate, w_up, w_down,
+    n_q_heads, n_kv_heads, head_dim,
+    rope_theta, eps,
+  ))
+}
+
+effect fn main() -> Unit = {
+  let t_load_start = datetime.monotonic_ns()
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+  println("GGUF loaded (" + int.to_string(list.len(file.tensors)) + " tensors)")
+
+  let hidden = 2048
+  let n_q_heads = 16
+  let n_kv_heads = 8
+  let head_dim = 128
+  let rope_theta = 1000000.0
+  let eps = 0.000001
+  let n_layers = 28
+
+  // Qwen3 tokens for "The capital of Japan is".
+  let tokens: List[Int] = [785, 6722, 315, 6323, 374]
+  println("Input tokens: " + (tokens |> list.map((i) => int.to_string(i)) |> list.join(", ")))
+
+  // Decode token_embd once — use it both for input lookup and tied lm_head.
+  let t_embd_start = datetime.monotonic_ns()
+  let token_embd = gguf.extract_q1_0_matrix(file, find_tensor(file, "token_embd.weight")!)
+  let t_embd_end = datetime.monotonic_ns()
+  println("token_embd decoded in " + int.to_string((t_embd_end - t_embd_start) / 1000000) + " ms")
+
+  // Build input by row-lookup: embed each token id and stack.
+  let embd_rows = matrix.to_lists(token_embd)
+  let input_rows = tokens |> list.map((id) => list.get_or(embd_rows, id, []))
+  var h = matrix.from_lists(input_rows)
+  let (seq_r, seq_c) = matrix.shape(h)
+  println("input embeddings shape: " + int.to_string(seq_r) + " x " + int.to_string(seq_c))
+
+  // 28-layer forward.
+  let t_fwd_start = datetime.monotonic_ns()
+  for layer in 0..n_layers {
+    h = run_layer(file, h, layer, n_q_heads, n_kv_heads, head_dim, rope_theta, eps)!
+  }
+  let t_fwd_end = datetime.monotonic_ns()
+  println("28-layer forward: " + int.to_string((t_fwd_end - t_fwd_start) / 1000000) + " ms")
+
+  // Final output_norm + tied lm_head.
+  let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
+  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
+  let logits = matrix.linear_row_no_bias(normed, token_embd)
+  let (lr, lc) = matrix.shape(logits)
+  println("logits shape: " + int.to_string(lr) + " x " + int.to_string(lc))
+
+  // Argmax on the LAST row (next-token prediction after the input prompt).
+  let logit_lists = matrix.to_lists(logits)
+  let last_row = list.get_or(logit_lists, lr - 1, [])
+  let (best_id, best_val) = last_row
+    |> list.enumerate
+    |> list.fold((0, -1000000000.0), (acc, entry) => {
+      let (bi, bv) = acc
+      let (i, v) = entry
+      if v > bv then (i, v) else (bi, bv)
+    })
+  println("TOP TOKEN: id=" + int.to_string(best_id) + " logit=" + float.to_string(best_val))
+  println("Reference (llama-cli): 26194 (\" Tokyo\")")
+  if best_id == 26194 then
+    println("REFERENCE MATCH ✓")
+  else
+    println("REFERENCE MISMATCH — top-5 needed for diagnosis")
+
+  let t_total = (datetime.monotonic_ns() - t_load_start) / 1000000
+  println("Total: " + int.to_string(t_total) + " ms")
+}
