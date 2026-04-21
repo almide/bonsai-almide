@@ -1,0 +1,97 @@
+// WASM entry point for Bonsai inference.
+//
+// Exposed: `predict_next(model_bytes, token_ids) -> Int`
+//
+// JS host loads GGUF bytes + tokenises the prompt externally (via
+// tokenizers.js / transformers.js — Qwen3 BPE lives there already),
+// passes the byte buffer and token-id list in, gets back the argmax
+// next-token id. No IO inside WASM — the probe reads everything from
+// the supplied bytes.
+
+import nn.gguf as gguf
+import nn.qwen3 as q3
+
+fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
+  match list.find(file.tensors, (t) => t.name == name) {
+    some(t) => ok(t),
+    none => err("tensor not found: " + name),
+  }
+
+fn block_tensor_name(layer: Int, suffix: String) -> String =
+  "blk." + int.to_string(layer) + "." + suffix
+
+effect fn run_layer(
+  file: gguf.GGUFFile,
+  h: Matrix,
+  layer: Int,
+  n_q_heads: Int, n_kv_heads: Int, head_dim: Int,
+  rope_theta: Float, eps: Float,
+) -> Result[Matrix, String] = {
+  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!)
+  let q_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!)
+  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!)
+  let ffn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!)
+  let w_q = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_q.weight"))!)
+  let w_k = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_k.weight"))!)
+  let w_v = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_v.weight"))!)
+  let w_o = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_output.weight"))!)
+  let w_gate = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_gate.weight"))!)
+  let w_up = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_up.weight"))!)
+  let w_down = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_down.weight"))!)
+  ok(q3.qwen3_block(
+    h,
+    attn_norm_gamma,
+    w_q, w_k, w_v, w_o,
+    q_norm_gamma, k_norm_gamma,
+    ffn_norm_gamma,
+    w_gate, w_up, w_down,
+    n_q_heads, n_kv_heads, head_dim,
+    rope_theta, eps,
+  ))
+}
+
+// Predict the next-token id given the full Bonsai GGUF bytes and a
+// list of prompt token ids.
+effect fn predict_next(model_bytes: Bytes, tokens: List[Int]) -> Result[Int, String] = {
+  let file = gguf.parse(model_bytes)!
+
+  // Qwen3-1.7B hparams (from GGUF metadata — hard-coded for the 1.7B
+  // Bonsai build; separate entry could parse them dynamically).
+  let n_q_heads = 16
+  let n_kv_heads = 8
+  let head_dim = 128
+  let rope_theta = 1000000.0
+  let eps = 0.000001
+  let n_layers = 28
+
+  let token_embd = gguf.extract_q1_0_matrix(file, find_tensor(file, "token_embd.weight")!)
+
+  // Embed each token id as a row of token_embd, stack into a [seq, hidden] matrix.
+  let embd_rows = matrix.to_lists(token_embd)
+  let input_rows = tokens |> list.map((id) => list.get_or(embd_rows, id, []))
+  var h = matrix.from_lists(input_rows)
+
+  for layer in 0..n_layers {
+    h = run_layer(file, h, layer, n_q_heads, n_kv_heads, head_dim, rope_theta, eps)!
+  }
+
+  let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
+  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
+  let logits = matrix.linear_row_no_bias(normed, token_embd)
+
+  // Argmax on the last row (next-token distribution).
+  let (lr, _lc) = matrix.shape(logits)
+  let last_row = matrix.to_lists(logits) |> list.get(lr - 1) |> option.unwrap_or([])
+  let (best_id, _best_v) = last_row
+    |> list.enumerate
+    |> list.fold((0, -1000000000.0), (acc, entry) => {
+      let (bi, bv) = acc
+      let (i, v) = entry
+      if v > bv then (i, v) else (bi, bv)
+    })
+  ok(best_id)
+}
+
+// Allow a host-callable smoke entry that doesn't require a model (useful
+// to verify the build + linkage before downloading 248 MB).
+fn wasm_health_check() -> Int = 42
