@@ -124,18 +124,13 @@ effect fn predict_next(model_bytes: Bytes, tokens: List[Int]) -> Result[Int, Str
   let n_layers = 28
   let hidden = n_q_heads * head_dim
 
-  // Embedding lookup: read just the prompt rows from token_embd directly
-  // (avoids decoding the full 2.5 GB embedding matrix — we decode only
-  // the 5-ish rows the prompt actually needs).
+  // Embedding lookup: decode only the rows the prompt actually needs,
+  // straight from the packed Q1_0 bytes. Saves the 2.5 GB full-matrix
+  // allocation that was formerly needed per call.
   let embd_info = find_tensor(file, "token_embd.weight")!
-  let embd_rows_needed = tokens
-  // token_embd shape: [vocab, hidden]. Bytes offset per row = row * hidden/128 * 18.
-  // We piggyback matrix.select_rows on a decoded partial view; but since we need
-  // only 5 rows we decode 5 rows manually via a helper primitive.
-  // For now we simplify by extracting the whole embedding (2.5 GB) and selecting.
-  // A future refinement would add matrix.q1_0_select_rows to cut this allocation.
-  let token_embd = gguf.extract_q1_0_matrix(file, embd_info)
-  var h = matrix.select_rows(token_embd, embd_rows_needed)
+  let embd_cols = list.get(embd_info.dims, 0) |> option.unwrap_or(hidden)
+  let embd_offset = file.data_offset + embd_info.offset
+  var h = matrix.select_rows_q1_0(file.raw, embd_offset, embd_cols, tokens)
 
   for layer in 0..n_layers {
     h = run_layer_q1_0(file, h, layer,
@@ -147,9 +142,8 @@ effect fn predict_next(model_bytes: Bytes, tokens: List[Int]) -> Result[Int, Str
   // lm_head ties to token_embd — and we already have it materialised above.
   // Use linear_q1_0_row_no_bias so lm_head doesn't require the decoded matrix
   // once q1_0_select_rows replaces the extract_q1_0_matrix above.
-  let logits = matrix.linear_q1_0_row_no_bias(normed, file.raw, file.data_offset + embd_info.offset,
-    list.get(embd_info.dims, 1) |> option.unwrap_or(1),  // rows = vocab
-    list.get(embd_info.dims, 0) |> option.unwrap_or(hidden))  // cols = hidden
+  let vocab = list.get(embd_info.dims, 1) |> option.unwrap_or(1)
+  let logits = matrix.linear_q1_0_row_no_bias(normed, file.raw, embd_offset, vocab, embd_cols)
 
   let (lr, _lc) = matrix.shape(logits)
   let last_row = matrix.to_lists(logits) |> list.get(lr - 1) |> option.unwrap_or([])
