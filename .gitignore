@@ -5,6 +5,7 @@ weights/*.gguf
 # Build artifacts except the published browser demo asset.
 *.wasm
 !examples/browser_demo/bonsai.wasm
+!docs/bonsai.wasm
 .DS_Store
 *.rmeta
 .almide/
