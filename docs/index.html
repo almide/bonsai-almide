@@ -80,7 +80,7 @@
 
 <script type="module">
 import { makeWasi } from './wasi_shim.js';
-import { AutoTokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/+esm';
+import { AutoTokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4/+esm';
 
 const $ = (id) => document.getElementById(id);
 const escapeHtml = (s) => s
@@ -357,8 +357,12 @@ $('sendBtn').addEventListener('click', async () => {
     } else if (encoded?.data) {
       tokens = Array.from(encoded.data, (n) => Number(n));
     } else {
-      throw new Error('apply_chat_template returned unexpected shape: ' + String(encoded));
+      const shape = encoded == null
+        ? String(encoded)
+        : `type=${typeof encoded} ctor=${encoded.constructor?.name ?? '?'} keys=${Object.keys(encoded).join(',')}`;
+      throw new Error('apply_chat_template returned unexpected shape: ' + shape);
     }
+    log('chat template → ' + JSON.stringify(tokenizer.decode(tokens, { skip_special_tokens: false })));
     log('prompt tokens (' + tokens.length + '): ' + tokens.join(', '));
     log(`sampling: temperature=${temperature} top_k=${topK} penalty=${repeatPenalty} seed=${seedStart}`);
 
