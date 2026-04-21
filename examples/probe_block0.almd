@@ -1,0 +1,91 @@
+// probe_block0 — run qwen3_block with real blk.0 weights from Bonsai.
+//
+// Goal: end-to-end pipeline validation. Prove that
+//   GGUF load → Q1_0 extract → qwen3_block(real weights, input)
+// produces a finite output of the right shape. This is the last step
+// before scaling up to the 28-layer forward pass.
+//
+// Extracted Q1_0 weights (blk.0 only): ~50 M params. At the current
+// 525 k weights/s decode rate, about 95 s one-off cost.
+
+import nn.gguf as gguf
+import nn.qwen3 as q3
+
+fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
+  match list.find(file.tensors, (t) => t.name == name) {
+    some(t) => ok(t),
+    none => err("tensor not found: " + name),
+  }
+
+effect fn main() -> Unit = {
+  println("Loading Bonsai-1.7B-Q1_0.gguf...")
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+  println("  " + int.to_string(list.len(file.tensors)) + " tensors")
+
+  // Qwen3 config (from GGUF metadata, encoded above).
+  let hidden = 2048
+  let ffn_hidden = 6144
+  let n_q_heads = 16
+  let n_kv_heads = 8
+  let head_dim = 128
+  let rope_theta = 1000000.0
+  let eps = 0.000001
+
+  println("Extracting blk.0 Q1_0 weights (~50M params, ~95s)...")
+
+  let w_q = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.attn_q.weight")!)
+  println("  wq done")
+  let w_k = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.attn_k.weight")!)
+  println("  wk done")
+  let w_v = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.attn_v.weight")!)
+  println("  wv done")
+  let w_o = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.attn_output.weight")!)
+  println("  wo done")
+  let w_gate = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.ffn_gate.weight")!)
+  println("  w_gate done")
+  let w_up = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.ffn_up.weight")!)
+  println("  w_up done")
+  let w_down = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.ffn_down.weight")!)
+  println("  w_down done")
+
+  // F32 norm gammas.
+  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "blk.0.attn_norm.weight")!)
+  let q_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "blk.0.attn_q_norm.weight")!)
+  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "blk.0.attn_k_norm.weight")!)
+  let ffn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "blk.0.ffn_norm.weight")!)
+
+  println("All weights loaded. Running qwen3_block...")
+
+  // Input: seq_len=1, hidden=2048 of ones. (Real inference would be an
+  // embedding lookup — we skip that for this probe.)
+  let x = matrix.ones(1, hidden)
+  let y = q3.qwen3_block(
+    x,
+    attn_norm_gamma,
+    w_q, w_k, w_v, w_o,
+    q_norm_gamma, k_norm_gamma,
+    ffn_norm_gamma,
+    w_gate, w_up, w_down,
+    n_q_heads, n_kv_heads, head_dim,
+    rope_theta, eps,
+  )
+
+  let (rows, cols) = matrix.shape(y)
+  println("Output shape: " + int.to_string(rows) + " x " + int.to_string(cols))
+
+  // Sample first 8 values and scan for NaN.
+  let out_rows = matrix.to_lists(y)
+  let row0 = list.get_or(out_rows, 0, [])
+  let first8 = list.take(row0, 8)
+    |> list.map((v) => float.to_string(v))
+    |> list.join(", ")
+  println("First 8 output values: " + first8)
+
+  let nan_count = row0 |> list.filter((v) => float.is_nan(v)) |> list.len
+  let inf_count = row0 |> list.filter((v) => float.is_infinite(v)) |> list.len
+  println("NaN: " + int.to_string(nan_count) + "  Inf: " + int.to_string(inf_count))
+  if nan_count == 0 and inf_count == 0 and rows == 1 and cols == hidden then
+    println("BLOCK FORWARD OK")
+  else
+    println("BLOCK FORWARD ISSUE")
+}

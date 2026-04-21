@@ -1,3 +1,3 @@
 # almide.lock — auto-generated, do not edit
 
-nn = { git = "file:///Users/o6lvl4/workspace/github.com/almide/nn", ref = "main", commit = "35b3d4641f254ffd875f169dd6210c7d504424f9" }
+nn = { git = "file:///Users/o6lvl4/workspace/github.com/almide/nn", ref = "main", commit = "1b1fd29791aeef574aeb32e30cd3fb87bec8d6db" }

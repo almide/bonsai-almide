@@ -1,0 +1,37 @@
+// probe_extract — confirm we can extract a real Q1_0 weight matrix
+// from Bonsai and inspect its shape + sample values. Uses
+// blk.0.attn_k.weight (2048 x 1024 Q1_0, 16384 blocks, ~3 MB on disk).
+
+import nn.gguf as gguf
+
+effect fn main() -> Unit = {
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+
+  match list.find(file.tensors, (t) => t.name == "blk.0.attn_k.weight") {
+    some(info) => {
+      println("Found " + info.name)
+      let dims = info.dims |> list.map((d) => int.to_string(d)) |> list.join("x")
+      println("  shape: " + dims + ", dtype=" + int.to_string(info.dtype))
+      let elements = list.fold(info.dims, 1, (acc, d) => acc * d)
+      println("  elements: " + int.to_string(elements))
+      println("  blocks: " + int.to_string(elements / 128))
+
+      println("Extracting (pure-Almide decode; expect several seconds)...")
+      let values = gguf.extract_q1_0_tensor(file, info)
+      println("  decoded " + int.to_string(list.len(values)) + " floats")
+
+      // Sanity: all values should be nonzero and bounded.
+      let first8 = list.take(values, 8)
+        |> list.map((v) => float.to_string(v))
+        |> list.join(", ")
+      println("  first 8: " + first8)
+
+      // Materialise as Matrix and confirm shape.
+      let m = gguf.extract_q1_0_matrix(file, info)
+      println("  matrix rows: " + int.to_string(matrix.shape(m).0))
+      println("  matrix cols: " + int.to_string(matrix.shape(m).1))
+      println("EXTRACT OK")
+    },
+    none => println("blk.0.attn_k.weight not found"),
+  }
+}
