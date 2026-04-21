@@ -163,6 +163,22 @@ effect fn predict_next(model_bytes: Bytes, tokens: List[Int]) -> Result[Int, Str
   ok(best_id)
 }
 
+// Predict the next `n_new` tokens and return them as a list. Currently
+// implemented naïvely: call predict_next `n_new` times, each time with
+// the prompt extended by the previously-generated token. No KV cache,
+// so each call replays the whole forward pass (~10 s WASM per step on
+// a 5-token prompt). Enough for a "did it really run" chat demo.
+effect fn predict_tokens(model_bytes: Bytes, tokens: List[Int], n_new: Int) -> Result[List[Int], String] = {
+  var context = tokens
+  var out: List[Int] = []
+  for _ in 0..n_new {
+    let next = predict_next(model_bytes, context)!
+    list.push(out, next)
+    list.push(context, next)
+  }
+  ok(out)
+}
+
 // Allow a host-callable smoke entry that doesn't require a model (useful
 // to verify the build + linkage before downloading 248 MB).
 fn wasm_health_check() -> Int = 42
