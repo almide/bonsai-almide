@@ -47,6 +47,8 @@
     <input id="temperature" type="number" value="0.8" min="0" max="2" step="0.1" style="width: 4em" />
     Top-k:
     <input id="topK" type="number" value="40" min="1" max="200" style="width: 4em" />
+    Penalty:
+    <input id="penalty" type="number" value="1.3" min="1.0" max="2.0" step="0.05" style="width: 4.5em" />
     Seed:
     <input id="seed" type="number" value="42" min="0" style="width: 6em" />
     <button id="sendBtn" disabled>Send (KV cache streaming)</button>
@@ -306,13 +308,17 @@ $('sendBtn').addEventListener('click', async () => {
   const nNew = Math.min(60, Math.max(1, parseInt($('maxNew').value, 10)));
   const temperature = Math.max(0, Math.min(2, parseFloat($('temperature').value)));
   const topK = Math.max(1, Math.min(200, parseInt($('topK').value, 10)));
+  const repeatPenalty = Math.max(1.0, Math.min(2.0, parseFloat($('penalty').value)));
+  const repeatWindow = 32;
   const seedStart = Math.max(0, parseInt($('seed').value, 10) >>> 0) || 1;
-  let rngState = seedStart;
+  // mulberry32: good uniformity even for small seeds, no warm-up needed.
+  let rngState = (seedStart * 2654435769) >>> 0;
   const nextRand = () => {
-    rngState ^= rngState << 13; rngState >>>= 0;
-    rngState ^= rngState >>> 17;
-    rngState ^= rngState << 5;  rngState >>>= 0;
-    return (rngState >>> 0) / 0x100000000;
+    rngState = (rngState + 0x6D2B79F5) >>> 0;
+    let t = rngState;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 0x100000000;
   };
   const chatEl = $('chat');
   try {
@@ -320,7 +326,7 @@ $('sendBtn').addEventListener('click', async () => {
     const encoded = await tokenizer(prompt, { add_special_tokens: false });
     const tokens = Array.from(encoded.input_ids.data, (n) => Number(n));
     log('prompt tokens (' + tokens.length + '): ' + tokens.join(', '));
-    log(`sampling: temperature=${temperature} top_k=${topK} seed=${seedStart}`);
+    log(`sampling: temperature=${temperature} top_k=${topK} penalty=${repeatPenalty} seed=${seedStart}`);
 
     chatEl.innerHTML = '<span class="user">' + prompt + '</span><span class="ai"></span>';
     const aiEl = chatEl.querySelector('.ai');
@@ -342,6 +348,7 @@ $('sendBtn').addEventListener('click', async () => {
     const rp0 = predict_prompt_kv_bytes(
       modelPtr, promptListPtr,
       temperature, BigInt(topK), nextRand(),
+      repeatPenalty,
     );
     const { next: firstTok, keys: keys0, values: values0 } = readResultTupleIntKV(rp0);
     const promptElapsed = performance.now() - t0;
@@ -361,11 +368,14 @@ $('sendBtn').addEventListener('click', async () => {
     let lastTok = firstTok;
     let curKeys = keys0;
     let curValues = values0;
+    const recentHistory = [...tokens, firstTok];
     for (let step = 1; step < nNew; step++) {
       runStatus(`streaming token ${step + 1}/${nNew} (pos ${pos})…`);
       await new Promise((r) => setTimeout(r, 30));
       const keysListPtr = writeBytesList(curKeys);
       const valuesListPtr = writeBytesList(curValues);
+      const recent = recentHistory.slice(-repeatWindow);
+      const recentPtr = writeTokenList(recent);
       const ts = performance.now();
       const rpi = predict_step_kv_bytes(
         modelPtr,
@@ -373,9 +383,11 @@ $('sendBtn').addEventListener('click', async () => {
         valuesListPtr,
         BigInt(lastTok),
         BigInt(pos),
+        recentPtr,
         temperature,
         BigInt(topK),
         nextRand(),
+        repeatPenalty,
       );
       const { next, keys: nk, values: nv } = readResultTupleIntKV(rpi);
       const elapsed = performance.now() - ts;
@@ -386,6 +398,7 @@ $('sendBtn').addEventListener('click', async () => {
       lastTok = next;
       pos += 1;
       generated.push(next);
+      recentHistory.push(next);
       aiEl.textContent = tokenizer.decode(generated, { skip_special_tokens: false });
       log(`  step ${step}: token ${next} → ${JSON.stringify(tokenizer.decode([next]))} in ${(elapsed / 1000).toFixed(1)}s`);
     }

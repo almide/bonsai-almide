@@ -297,19 +297,42 @@ fn top_k_threshold(xs: List[Float], k: Int) -> Float = {
   kth
 }
 
-// Temperature + top-k sampling. Greedy when temperature <= 0 or top_k
-// <= 1. Otherwise: scale by temperature → keep the top_k largest →
+// OpenAI-style repetition penalty: each logit whose index appears in
+// `recent` is divided (if positive) or multiplied (if negative) by
+// `penalty`. Applied BEFORE temperature scaling so the effect
+// strengthens as penalty → ∞ and vanishes at penalty = 1.
+fn apply_repetition_penalty(logits: List[Float], recent: List[Int], penalty: Float) -> List[Float] = {
+  if penalty <= 1.0 or list.len(recent) == 0 then logits
+  else logits |> list.enumerate |> list.map((pair) => {
+    let (idx, v) = pair
+    if list.contains(recent, idx) then {
+      if v > 0.0 then v / penalty else v * penalty
+    } else v
+  })
+}
+
+// Temperature + top-k sampling with optional repetition penalty.
+// Greedy when temperature <= 0 or top_k <= 1. Otherwise: penalize
+// recent tokens → scale by temperature → keep the top_k largest →
 // softmax → pick by cumulative weight with `rand01` in [0, 1).
-fn sample_from_logits(logits: List[Float], temperature: Float, top_k: Int, rand01: Float) -> Int = {
-  if temperature <= 0.0 or top_k <= 1 then argmax_f64(logits)
+fn sample_from_logits(
+  logits: List[Float],
+  temperature: Float,
+  top_k: Int,
+  rand01: Float,
+  recent: List[Int],
+  repeat_penalty: Float,
+) -> Int = {
+  let penalised = apply_repetition_penalty(logits, recent, repeat_penalty)
+  if temperature <= 0.0 or top_k <= 1 then argmax_f64(penalised)
   else {
-    let scaled = logits |> list.map((v) => v / temperature)
+    let scaled = penalised |> list.map((v) => v / temperature)
     let threshold = top_k_threshold(scaled, top_k)
     let max_v = list.fold(scaled, -1.0e30, (a, b) => if a > b then a else b)
     let exps = scaled |> list.map((v) =>
       if v >= threshold then math.exp(v - max_v) else 0.0)
     let sum = list.fold(exps, 0.0, (a, b) => a + b)
-    if sum <= 0.0 then argmax_f64(logits)
+    if sum <= 0.0 then argmax_f64(penalised)
     else pick_cumulative(exps, rand01 * sum)
   }
 }
@@ -323,6 +346,8 @@ effect fn predict_next_kv(
   temperature: Float,
   top_k: Int,
   rand01: Float,
+  recent: List[Int],
+  repeat_penalty: Float,
 ) -> Result[(Int, List[Matrix], List[Matrix]), String] = {
   let n_q_heads = 16
   let n_kv_heads = 8
@@ -361,7 +386,7 @@ effect fn predict_next_kv(
 
   let (lr, _lc) = matrix.shape(logits)
   let last_row = matrix.to_lists(logits) |> list.get(lr - 1) |> option.unwrap_or([])
-  let chosen_id = sample_from_logits(last_row, temperature, top_k, rand01)
+  let chosen_id = sample_from_logits(last_row, temperature, top_k, rand01, recent, repeat_penalty)
   ok((chosen_id, new_keys, new_values))
 }
 
@@ -381,6 +406,7 @@ effect fn predict_prompt_kv_bytes(
   temperature: Float,
   top_k: Int,
   rand01: Float,
+  repeat_penalty: Float,
 ) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
   let file = gguf.parse(model_bytes)!
   let kv_hidden = 8 * 128
@@ -394,7 +420,8 @@ effect fn predict_prompt_kv_bytes(
   }
 
   let (next, new_keys, new_values) = predict_next_kv(
-    file, keys, values, prompt, 0, temperature, top_k, rand01,
+    file, keys, values, prompt, 0,
+    temperature, top_k, rand01, prompt, repeat_penalty,
   )!
   let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
   let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
@@ -407,9 +434,11 @@ effect fn predict_step_kv_bytes(
   kv_values_bytes: List[Bytes],
   last_token: Int,
   start_pos: Int,
+  recent_tokens: List[Int],
   temperature: Float,
   top_k: Int,
   rand01: Float,
+  repeat_penalty: Float,
 ) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
   let file = gguf.parse(model_bytes)!
   let kv_hidden = 8 * 128
@@ -424,7 +453,8 @@ effect fn predict_step_kv_bytes(
   })
 
   let (next, new_keys, new_values) = predict_next_kv(
-    file, keys, values, [last_token], start_pos, temperature, top_k, rand01,
+    file, keys, values, [last_token], start_pos,
+    temperature, top_k, rand01, recent_tokens, repeat_penalty,
   )!
   let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
   let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
@@ -449,14 +479,14 @@ effect fn predict_tokens_kv(model_bytes: Bytes, prompt: List[Int], n_new: Int) -
   }
 
   var out: List[Int] = []
-  let (first, k1, v1) = predict_next_kv(file, keys, values, prompt, 0, 0.0, 1, 0.0)!
+  let (first, k1, v1) = predict_next_kv(file, keys, values, prompt, 0, 0.0, 1, 0.0, [], 1.0)!
   keys = k1
   values = v1
   list.push(out, first)
   var pos = list.len(prompt)
   var last = first
   for _ in 0..(n_new - 1) {
-    let (next, k_upd, v_upd) = predict_next_kv(file, keys, values, [last], pos, 0.0, 1, 0.0)!
+    let (next, k_upd, v_upd) = predict_next_kv(file, keys, values, [last], pos, 0.0, 1, 0.0, [], 1.0)!
     keys = k_upd
     values = v_upd
     list.push(out, next)

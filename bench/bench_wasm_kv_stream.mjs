@@ -112,15 +112,17 @@ async function main() {
   const temperature = Number(process.env.TEMP ?? 0.0);
   const topK = Number(process.env.TOP_K ?? 1);
   const seed = Number(process.env.SEED ?? 42);
-  let rngState = seed >>> 0;
+  const repeatPenalty = Number(process.env.PENALTY ?? 1.0);
+  const repeatWindow = Number(process.env.WINDOW ?? 32);
+  let rngState = (seed * 2654435769) >>> 0;
   const nextRand = () => {
-    // xorshift32 → [0, 1)
-    rngState ^= rngState << 13; rngState >>>= 0;
-    rngState ^= rngState >>> 17;
-    rngState ^= rngState << 5;  rngState >>>= 0;
-    return (rngState >>> 0) / 0x100000000;
+    rngState = (rngState + 0x6D2B79F5) >>> 0;
+    let t = rngState;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 0x100000000;
   };
-  console.log(`sampling: temperature=${temperature}  top_k=${topK}  seed=${seed}`);
+  console.log(`sampling: temperature=${temperature}  top_k=${topK}  seed=${seed}  penalty=${repeatPenalty}  window=${repeatWindow}`);
 
   const promptPtr = writeTokenList(instance, prompt);
   console.log(`prompt eval (${prompt.length} tokens)…`);
@@ -128,6 +130,7 @@ async function main() {
   const rp0 = (predict_prompt_kv_bytes(
     modelPtr, promptPtr,
     temperature, BigInt(topK), nextRand(),
+    repeatPenalty,
   ) >>> 0);
   const { next: firstTok, keys: keys0, values: values0 } = readResultTupleIntKV(memory, rp0);
   const t1 = performance.now();
@@ -140,14 +143,19 @@ async function main() {
   let lastTok = firstTok;
   let pos = prompt.length;
   const generated = [firstTok];
+  const recentHistory = [...prompt, firstTok];
   for (let step = 1; step < nGen; step++) {
     const keysListPtr = writeBytesList(instance, curKeys);
     const valuesListPtr = writeBytesList(instance, curValues);
+    const recent = recentHistory.slice(-repeatWindow);
+    const recentPtr = writeTokenList(instance, recent);
     const ts = performance.now();
     const rpi = (predict_step_kv_bytes(
       modelPtr, keysListPtr, valuesListPtr,
       BigInt(lastTok), BigInt(pos),
+      recentPtr,
       temperature, BigInt(topK), nextRand(),
+      repeatPenalty,
     ) >>> 0);
     const r = readResultTupleIntKV(memory, rpi);
     const elapsed = performance.now() - ts;
@@ -157,6 +165,7 @@ async function main() {
     lastTok = r.next;
     pos += 1;
     generated.push(r.next);
+    recentHistory.push(r.next);
     console.log(`  step ${step}: next = ${r.next}  in ${elapsed.toFixed(0)} ms  peak heap ${(memory.buffer.byteLength / 1024 / 1024).toFixed(0)} MB`);
   }
   console.log(`generated: ${generated.join(', ')}`);
