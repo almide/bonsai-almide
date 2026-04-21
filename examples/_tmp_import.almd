@@ -1,0 +1,5 @@
+import nn.gguf as gguf
+
+effect fn main() -> Unit = {
+  println("hello")
+}

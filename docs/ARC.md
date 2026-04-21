@@ -106,9 +106,15 @@ The narrative we want: **"One URL → Bonsai runs in browser. Written in a langu
 | Model structure | single block | 28 layers + KV cache + tied embed/lm_head |
 | Weight loader | nn has GGUF F16/F32 | extend `nn/gguf.almd` with dtype 41 (Q1_0) decode |
 
-## Known upstream blockers
+## Upstream unblocks (2026-04-21)
 
-- **almide `fs.stat` / `FileStat` codegen bug** (2026-04-20): compiling any package that pulls in `fs.stat` (including `nn` via `nn/gguf.almd`) produces invalid Rust — `FileStat` struct is referenced from `runtime/rs/src/fs.rs` but its definition is missing from the generated runtime glue. Work is in progress on the `fix/filestat-dedup-empty` branch of the `almide` repo. bonsai-almide probe (`examples/probe_gguf.almd`) is pre-written and waiting for that fix to land.
+Two upstream blockers landed before P0 could start; both fixed and committed on feature branches:
+
+- **almide `fs.stat` / `FileStat` codegen bug** (fixed on `almide` branch `fix/filestat-external-pkg`): `resolve.rs::load_submodule` did not recursively resolve a submodule's own imports, so when an external package's submodule (e.g. `nn.gguf`) imported a bundled stdlib (`fs`, `process`), that stdlib's `type_decls` never reached the main program — codegen emitted `almide_rt_fs_stat` referencing an undefined `FileStat` struct. Fix mirrors the recursion used by `load_module` / `load_self_module`.
+
+- **nn `gguf.almd` parse stack overflow + 248 MB Bytes clone** (fixed on `nn` branch `fix/gguf-iterative-parse`): Qwen3-class GGUF tokenizer metadata contains 150k+ element arrays. Original recursive form overflowed the stack; naive iterative form made `data: Bytes` owned, cloning the 248 MB buffer on every inner call. Fix: split `read_value` into `read_scalar_value` (stays pass-by-reference, hot path) and `read_array` (mutating accumulation), with `parse_metadata_entries` inlining the vtype dispatch so scalar entries never trigger a 248 MB clone. Remaining clones: 1 (initial dispatch into `parse_metadata_entries`). Probe now completes in seconds and prints full tensor inventory.
+
+probe (`examples/probe_gguf.almd`) confirms: GGUF v3 loaded, 310 tensors enumerated, Q1_0 layout (18 bytes / 128 weights) verified at runtime via offset arithmetic.
 
 ## Technical risks
 

@@ -1,0 +1,10 @@
+import nn.gguf as gguf
+
+effect fn main() -> Unit = {
+  println("start")
+  println("before load")
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+  println("after load")
+  println("version: " + int.to_string(file.header.version))
+  println("end")
+}
