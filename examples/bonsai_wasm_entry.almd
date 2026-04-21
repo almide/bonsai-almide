@@ -242,12 +242,87 @@ effect fn run_layer_q1_0_kv(
   ok((matrix.add(x_attn, ffn_out), k_full_kv, v_full_kv))
 }
 
+fn argmax_f64(logits: List[Float]) -> Int = {
+  let (best_id, _best_v) = logits
+    |> list.enumerate
+    |> list.fold((0, -1.0e30), (acc, entry) => {
+      let (bi, bv) = acc
+      let (i, v) = entry
+      if v > bv then (i, v) else (bi, bv)
+    })
+  best_id
+}
+
+// Walk the cumulative weight sum until it crosses `target`. Returns
+// the bucket index the target falls in, or the last index if drift
+// leaves us short.
+fn pick_cumulative(weights: List[Float], target: Float) -> Int = {
+  var acc = 0.0
+  var chosen = -1
+  var i = 0
+  let n = list.len(weights)
+  while i < n and chosen < 0 {
+    let w = list.get(weights, i) |> option.unwrap_or(0.0)
+    acc = acc + w
+    if acc >= target then { chosen = i }
+    i = i + 1
+  }
+  if chosen >= 0 then chosen else n - 1
+}
+
+// K-th largest value in `xs` via k passes of argmax-then-mask
+// (O(n*k)). `list.sort` on Float isn't supported by the current WASM
+// codegen, and k is small (~40) so the quadratic factor is cheap
+// compared to the ~150k-element softmax that follows.
+fn top_k_threshold(xs: List[Float], k: Int) -> Float = {
+  var remaining = xs |> list.map((v) => v)
+  var kth = -1.0e30
+  var step = 0
+  while step < k {
+    var best_v = -1.0e30
+    var best_i = -1
+    var j = 0
+    let n = list.len(remaining)
+    while j < n {
+      let v = list.get(remaining, j) |> option.unwrap_or(-1.0e30)
+      if v > best_v then { best_v = v; best_i = j }
+      j = j + 1
+    }
+    if best_i >= 0 then {
+      remaining = list.set(remaining, best_i, -1.0e30)
+      kth = best_v
+    }
+    step = step + 1
+  }
+  kth
+}
+
+// Temperature + top-k sampling. Greedy when temperature <= 0 or top_k
+// <= 1. Otherwise: scale by temperature → keep the top_k largest →
+// softmax → pick by cumulative weight with `rand01` in [0, 1).
+fn sample_from_logits(logits: List[Float], temperature: Float, top_k: Int, rand01: Float) -> Int = {
+  if temperature <= 0.0 or top_k <= 1 then argmax_f64(logits)
+  else {
+    let scaled = logits |> list.map((v) => v / temperature)
+    let threshold = top_k_threshold(scaled, top_k)
+    let max_v = list.fold(scaled, -1.0e30, (a, b) => if a > b then a else b)
+    let exps = scaled |> list.map((v) =>
+      if v >= threshold then math.exp(v - max_v) else 0.0)
+    let sum = list.fold(exps, 0.0, (a, b) => a + b)
+    if sum <= 0.0 then argmax_f64(logits)
+    else pick_cumulative(exps, rand01 * sum)
+  }
+}
+
 effect fn predict_next_kv(
   file: gguf.GGUFFile,
   kv_keys: List[Matrix],
   kv_values: List[Matrix],
   new_tokens: List[Int],
   start_pos: Int,
+  temperature: Float,
+  top_k: Int,
+  rand01: Float,
 ) -> Result[(Int, List[Matrix], List[Matrix]), String] = {
   let n_q_heads = 16
   let n_kv_heads = 8
@@ -286,14 +361,8 @@ effect fn predict_next_kv(
 
   let (lr, _lc) = matrix.shape(logits)
   let last_row = matrix.to_lists(logits) |> list.get(lr - 1) |> option.unwrap_or([])
-  let (best_id, _best_v) = last_row
-    |> list.enumerate
-    |> list.fold((0, -1000000000.0), (acc, entry) => {
-      let (bi, bv) = acc
-      let (i, v) = entry
-      if v > bv then (i, v) else (bi, bv)
-    })
-  ok((best_id, new_keys, new_values))
+  let chosen_id = sample_from_logits(last_row, temperature, top_k, rand01)
+  ok((chosen_id, new_keys, new_values))
 }
 
 // ── JS-streaming-friendly entries ───────────────────────────────────
@@ -309,6 +378,9 @@ effect fn predict_next_kv(
 effect fn predict_prompt_kv_bytes(
   model_bytes: Bytes,
   prompt: List[Int],
+  temperature: Float,
+  top_k: Int,
+  rand01: Float,
 ) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
   let file = gguf.parse(model_bytes)!
   let kv_hidden = 8 * 128
@@ -321,7 +393,9 @@ effect fn predict_prompt_kv_bytes(
     list.push(values, matrix.zeros(0, kv_hidden))
   }
 
-  let (next, new_keys, new_values) = predict_next_kv(file, keys, values, prompt, 0)!
+  let (next, new_keys, new_values) = predict_next_kv(
+    file, keys, values, prompt, 0, temperature, top_k, rand01,
+  )!
   let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
   let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
   ok((next, k_bytes, v_bytes))
@@ -333,6 +407,9 @@ effect fn predict_step_kv_bytes(
   kv_values_bytes: List[Bytes],
   last_token: Int,
   start_pos: Int,
+  temperature: Float,
+  top_k: Int,
+  rand01: Float,
 ) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
   let file = gguf.parse(model_bytes)!
   let kv_hidden = 8 * 128
@@ -346,7 +423,9 @@ effect fn predict_step_kv_bytes(
     matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
   })
 
-  let (next, new_keys, new_values) = predict_next_kv(file, keys, values, [last_token], start_pos)!
+  let (next, new_keys, new_values) = predict_next_kv(
+    file, keys, values, [last_token], start_pos, temperature, top_k, rand01,
+  )!
   let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
   let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
   ok((next, k_bytes, v_bytes))
@@ -370,14 +449,14 @@ effect fn predict_tokens_kv(model_bytes: Bytes, prompt: List[Int], n_new: Int) -
   }
 
   var out: List[Int] = []
-  let (first, k1, v1) = predict_next_kv(file, keys, values, prompt, 0)!
+  let (first, k1, v1) = predict_next_kv(file, keys, values, prompt, 0, 0.0, 1, 0.0)!
   keys = k1
   values = v1
   list.push(out, first)
   var pos = list.len(prompt)
   var last = first
   for _ in 0..(n_new - 1) {
-    let (next, k_upd, v_upd) = predict_next_kv(file, keys, values, [last], pos)!
+    let (next, k_upd, v_upd) = predict_next_kv(file, keys, values, [last], pos, 0.0, 1, 0.0)!
     keys = k_upd
     values = v_upd
     list.push(out, next)

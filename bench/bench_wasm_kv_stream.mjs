@@ -109,15 +109,31 @@ async function main() {
   const sessionMark = (__heap_save() >>> 0);
   const prompt = [785, 6722, 315, 6323, 374];
   const nGen = Number(process.env.N_GEN || 1);
-  const promptPtr = writeTokenList(instance, prompt);
+  const temperature = Number(process.env.TEMP ?? 0.0);
+  const topK = Number(process.env.TOP_K ?? 1);
+  const seed = Number(process.env.SEED ?? 42);
+  let rngState = seed >>> 0;
+  const nextRand = () => {
+    // xorshift32 → [0, 1)
+    rngState ^= rngState << 13; rngState >>>= 0;
+    rngState ^= rngState >>> 17;
+    rngState ^= rngState << 5;  rngState >>>= 0;
+    return (rngState >>> 0) / 0x100000000;
+  };
+  console.log(`sampling: temperature=${temperature}  top_k=${topK}  seed=${seed}`);
 
+  const promptPtr = writeTokenList(instance, prompt);
   console.log(`prompt eval (${prompt.length} tokens)…`);
   const t0 = performance.now();
-  const rp0 = (predict_prompt_kv_bytes(modelPtr, promptPtr) >>> 0);
+  const rp0 = (predict_prompt_kv_bytes(
+    modelPtr, promptPtr,
+    temperature, BigInt(topK), nextRand(),
+  ) >>> 0);
   const { next: firstTok, keys: keys0, values: values0 } = readResultTupleIntKV(memory, rp0);
   const t1 = performance.now();
   __heap_restore(sessionMark);
-  console.log(`  first tok = ${firstTok} (expect 26194)  in ${(t1 - t0).toFixed(0)} ms`);
+  const expected = temperature <= 0 || topK <= 1 ? ' (expect 26194)' : '';
+  console.log(`  first tok = ${firstTok}${expected}  in ${(t1 - t0).toFixed(0)} ms`);
   console.log(`  kv: ${keys0.length} layers × ${keys0[0]?.length ?? 0} B/layer = ${(keys0.length * (keys0[0]?.length ?? 0) / 1024 / 1024).toFixed(2)} MB`);
 
   let curKeys = keys0, curValues = values0;
@@ -131,6 +147,7 @@ async function main() {
     const rpi = (predict_step_kv_bytes(
       modelPtr, keysListPtr, valuesListPtr,
       BigInt(lastTok), BigInt(pos),
+      temperature, BigInt(topK), nextRand(),
     ) >>> 0);
     const r = readResultTupleIntKV(memory, rpi);
     const elapsed = performance.now() - ts;
