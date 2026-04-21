@@ -42,8 +42,8 @@
   </div>
   <div class="row">
     Max new tokens:
-    <input id="maxNew" type="number" value="6" min="1" max="30" style="width: 4em" />
-    <button id="sendBtn" disabled>Send (~10 s / token)</button>
+    <input id="maxNew" type="number" value="3" min="1" max="3" style="width: 4em" />
+    <button id="sendBtn" disabled>Send (KV cache, ~1.5 s/tok after prompt)</button>
     <span id="runStatus" class="status">waiting for model…</span>
   </div>
   <div id="chat" class="chat"></div>
@@ -56,7 +56,7 @@
 
 <p class="footer">
   Each generated token re-runs a full 28-layer forward
-  (<code>predict_next</code>, ~10 s at seq_len 5) — no KV cache yet, so a 10-token reply is ~2 min.
+  (<code>predict_tokens_kv</code>, KV cache). First token ≈ 8 s (full prompt forward), subsequent tokens ≈ 1.5 s each. Max 3 new tokens here because Almide's WASM bump allocator grows unbounded per gen step and would bust the 4 GB address space otherwise (heap-reclaim fix tracked separately).
   Each weight matrix stays packed in Q1_0 throughout via <code>matrix.linear_q1_0_row_no_bias</code>.
   Model is cached in IndexedDB on first run; subsequent loads are instant.
 </p>
@@ -142,6 +142,27 @@ function readResultInt(rp) {
   return Number(v.getBigInt64((rp >>> 0) + 4, true));
 }
 
+// Read Result[List[Int], String]. Memory may have grown during the call,
+// so rebind the DataView after every pointer follow.
+function readResultIntList(rp) {
+  let v = new DataView(wasmMemory.buffer);
+  const tag = v.getInt32(rp, true);
+  if (tag !== 0) {
+    const payload = Number(v.getBigInt64(rp + 4, true));
+    v = new DataView(wasmMemory.buffer);
+    const l = v.getInt32(payload, true);
+    throw new Error('Almide err: ' + new TextDecoder().decode(new Uint8Array(wasmMemory.buffer, payload + 4, l)));
+  }
+  const lp = Number(v.getBigInt64(rp + 4, true)) >>> 0;
+  v = new DataView(wasmMemory.buffer);
+  const len = v.getInt32(lp, true);
+  const out = [];
+  for (let i = 0; i < len; i++) {
+    out.push(Number(v.getBigInt64(lp + 4 + i * 8, true)));
+  }
+  return out;
+}
+
 function writeTokenList(tokens) {
   const { __alloc } = wasmInstance.exports;
   const ptr = (__alloc(4 + tokens.length * 8) >>> 0);
@@ -221,34 +242,25 @@ $('sendBtn').addEventListener('click', async () => {
     chatEl.innerHTML = '<span class="user">' + prompt + '</span><span class="ai"></span>';
     const aiEl = chatEl.querySelector('.ai');
 
-    // Mark the heap position *before* any predict_next scratch, so we can
-    // restore it between tokens. Almide's bump allocator doesn't reclaim
-    // otherwise — without this, one predict_next grows heap ~1.2 GB and
-    // the 3rd call would bust the 4 GB WASM cap.
-    const { __heap_save, __heap_restore } = wasmInstance.exports;
-    const sessionMark = __heap_save() >>> 0;
-
-    const context = [...tokens];
-    const generated = [];
-    let totalElapsed = 0;
-    for (let step = 0; step < nNew; step++) {
-      runStatus(`generating token ${step + 1}/${nNew} (context ${context.length} tokens)…`);
-      await new Promise((r) => setTimeout(r, 30));
-      const tokensPtr = writeTokenList(context);
-      const t0 = performance.now();
-      const rp = wasmInstance.exports.predict_next(modelPtr, tokensPtr);
-      const next = readResultInt(rp);
-      const elapsed = performance.now() - t0;
-      totalElapsed += elapsed;
-      // Free this call's scratch before the next token.
-      __heap_restore(sessionMark);
-      context.push(next);
-      generated.push(next);
-      const partial = tokenizer.decode(generated, { skip_special_tokens: false });
-      aiEl.textContent = partial;
-      log(`  step ${step + 1}: token ${next} → ${JSON.stringify(tokenizer.decode([next]))} in ${(elapsed / 1000).toFixed(1)}s`);
+    // KV-cache one-shot path: prompt-eval + nNew gen steps happen inside
+    // one Almide call (`predict_tokens_kv`), so we don't get per-token
+    // streaming in the UI, but we do get ~6.9x speedup over the per-token
+    // `predict_next` path. The Almide-side caches never leave WASM memory,
+    // which also means we can't __heap_restore between steps — that's why
+    // n_new is capped at 3 here (4 GB WASM cap).
+    runStatus(`generating ${nNew} token${nNew > 1 ? 's' : ''} via KV cache (prompt ${tokens.length} tok)…`);
+    await new Promise((r) => setTimeout(r, 30));
+    const promptPtr = writeTokenList(tokens);
+    const t0 = performance.now();
+    const rp = wasmInstance.exports.predict_tokens_kv(modelPtr, promptPtr, BigInt(nNew)) >>> 0;
+    const generated = readResultIntList(rp);
+    const elapsed = performance.now() - t0;
+    const text = tokenizer.decode(generated, { skip_special_tokens: false });
+    aiEl.textContent = text;
+    for (let i = 0; i < generated.length; i++) {
+      log(`  token ${i + 1}: ${generated[i]} → ${JSON.stringify(tokenizer.decode([generated[i]]))}`);
     }
-    runStatus(`done — ${nNew} tokens in ${(totalElapsed / 1000).toFixed(1)}s total (${(totalElapsed / nNew / 1000).toFixed(1)}s / token).`, 'ok');
+    runStatus(`done — ${generated.length} tokens in ${(elapsed / 1000).toFixed(1)}s total (${(elapsed / generated.length / 1000).toFixed(1)}s / token avg).`, 'ok');
   } catch (err) {
     runStatus('error: ' + err.message, 'error');
     log('ERROR: ' + (err.stack || err));
