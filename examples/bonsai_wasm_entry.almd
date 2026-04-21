@@ -173,6 +173,164 @@ effect fn predict_tokens(model_bytes: Bytes, tokens: List[Int], n_new: Int) -> R
   ok(out)
 }
 
+// ── KV-cache variant ────────────────────────────────────────────────
+//
+// `run_layer_q1_0_kv` / `predict_next_kv` are the gen-step-friendly
+// counterparts of the above. They accept per-layer K/V caches (rows =
+// previously-seen tokens, cols = kv_hidden) and the absolute position
+// of the input's first row, return the updated caches alongside the
+// next-token prediction. On the first call you pass `start_pos = 0`
+// and 28 zero-row caches; subsequent calls pass the returned caches
+// plus `start_pos = last_start + new_tokens.len`.
+effect fn run_layer_q1_0_kv(
+  file: gguf.GGUFFile,
+  h: Matrix,
+  k_cache: Matrix,
+  v_cache: Matrix,
+  start_pos: Int,
+  layer: Int,
+  n_q_heads: Int, n_kv_heads: Int, head_dim: Int,
+  ffn_hidden: Int,
+  rope_theta: Float, eps: Float,
+) -> Result[(Matrix, Matrix, Matrix), String] = {
+  let hidden = n_q_heads * head_dim
+  let kv_hidden = n_kv_heads * head_dim
+  let n_rep = n_q_heads / n_kv_heads
+
+  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!)
+  let q_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!)
+  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!)
+  let ffn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!)
+
+  let wq_info = find_tensor(file, block_tensor_name(layer, "attn_q.weight"))!
+  let wk_info = find_tensor(file, block_tensor_name(layer, "attn_k.weight"))!
+  let wv_info = find_tensor(file, block_tensor_name(layer, "attn_v.weight"))!
+  let wo_info = find_tensor(file, block_tensor_name(layer, "attn_output.weight"))!
+  let wgate_info = find_tensor(file, block_tensor_name(layer, "ffn_gate.weight"))!
+  let wup_info = find_tensor(file, block_tensor_name(layer, "ffn_up.weight"))!
+  let wdown_info = find_tensor(file, block_tensor_name(layer, "ffn_down.weight"))!
+
+  let base = file.data_offset
+  let raw = file.raw
+
+  let h_normed = matrix.rms_norm_rows(h, attn_norm_gamma, eps)
+  let q_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wq_info.offset, hidden, hidden)
+  let k_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wk_info.offset, kv_hidden, hidden)
+  let v_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wv_info.offset, kv_hidden, hidden)
+
+  let q_normed = q3.per_head_rms_norm(q_proj, q_norm_gamma, n_q_heads, eps)
+  let k_normed = q3.per_head_rms_norm(k_proj, k_norm_gamma, n_kv_heads, eps)
+
+  let q_rot = matrix.rope_rotate_at(q_normed, n_q_heads, head_dim, rope_theta, start_pos)
+  let k_rot = matrix.rope_rotate_at(k_normed, n_kv_heads, head_dim, rope_theta, start_pos)
+
+  // Accumulate K/V with the running cache, then broadcast across heads.
+  let k_full_kv = matrix.append_rows(k_cache, k_rot)
+  let v_full_kv = matrix.append_rows(v_cache, v_proj)
+  let k_full = q3.repeat_kv(k_full_kv, n_kv_heads, n_rep)
+  let v_full = q3.repeat_kv(v_full_kv, n_kv_heads, n_rep)
+
+  let attn_out = matrix.masked_multi_head_attention(q_rot, k_full, v_full, n_q_heads)
+  let attn_proj = matrix.linear_q1_0_row_no_bias(attn_out, raw, base + wo_info.offset, hidden, hidden)
+  let x_attn = matrix.add(h, attn_proj)
+
+  let h2 = matrix.rms_norm_rows(x_attn, ffn_norm_gamma, eps)
+  let gate = matrix.linear_q1_0_row_no_bias(h2, raw, base + wgate_info.offset, ffn_hidden, hidden)
+  let up = matrix.linear_q1_0_row_no_bias(h2, raw, base + wup_info.offset, ffn_hidden, hidden)
+  let gated = matrix.silu_mul(gate, up)
+  let ffn_out = matrix.linear_q1_0_row_no_bias(gated, raw, base + wdown_info.offset, hidden, ffn_hidden)
+  ok((matrix.add(x_attn, ffn_out), k_full_kv, v_full_kv))
+}
+
+effect fn predict_next_kv(
+  file: gguf.GGUFFile,
+  kv_keys: List[Matrix],
+  kv_values: List[Matrix],
+  new_tokens: List[Int],
+  start_pos: Int,
+) -> Result[(Int, List[Matrix], List[Matrix]), String] = {
+  let n_q_heads = 16
+  let n_kv_heads = 8
+  let head_dim = 128
+  let ffn_hidden = 6144
+  let rope_theta = 1000000.0
+  let eps = 0.000001
+  let n_layers = 28
+  let hidden = n_q_heads * head_dim
+  let kv_hidden = n_kv_heads * head_dim
+
+  let embd_info = find_tensor(file, "token_embd.weight")!
+  let embd_cols = list.get(embd_info.dims, 0) |> option.unwrap_or(hidden)
+  let embd_offset = file.data_offset + embd_info.offset
+
+  var h = matrix.select_rows_q1_0(file.raw, embd_offset, embd_cols, new_tokens)
+  var new_keys = list.take(kv_keys, list.len(kv_keys))
+  var new_values = list.take(kv_values, list.len(kv_values))
+
+  for layer in 0..n_layers {
+    let k_cache = list.get(kv_keys, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
+    let v_cache = list.get(kv_values, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
+    let (h_next, k_new, v_new) = run_layer_q1_0_kv(
+      file, h, k_cache, v_cache, start_pos, layer,
+      n_q_heads, n_kv_heads, head_dim, ffn_hidden, rope_theta, eps,
+    )!
+    h = h_next
+    new_keys = list.set(new_keys, layer, k_new)
+    new_values = list.set(new_values, layer, v_new)
+  }
+
+  let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
+  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
+  let vocab = list.get(embd_info.dims, 1) |> option.unwrap_or(1)
+  let logits = matrix.linear_q1_0_row_no_bias(normed, file.raw, embd_offset, vocab, embd_cols)
+
+  let (lr, _lc) = matrix.shape(logits)
+  let last_row = matrix.to_lists(logits) |> list.get(lr - 1) |> option.unwrap_or([])
+  let (best_id, _best_v) = last_row
+    |> list.enumerate
+    |> list.fold((0, -1000000000.0), (acc, entry) => {
+      let (bi, bv) = acc
+      let (i, v) = entry
+      if v > bv then (i, v) else (bi, bv)
+    })
+  ok((best_id, new_keys, new_values))
+}
+
+// Single-shot KV-cache generation: prompt-eval + n_new gen steps with
+// the caches kept entirely Almide-side. Returns just the generated
+// token-id list (prompt not included). JS hosts can't easily reach
+// inside a `(Int, List[Matrix], List[Matrix])` tuple on their own, so
+// this wrapper is the intended WASM entry for KV-cache inference.
+effect fn predict_tokens_kv(model_bytes: Bytes, prompt: List[Int], n_new: Int) -> Result[List[Int], String] = {
+  let file = gguf.parse(model_bytes)!
+  let kv_hidden = 8 * 128
+  let n_layers = 28
+
+  var keys: List[Matrix] = []
+  var values: List[Matrix] = []
+  for _ in 0..n_layers {
+    list.push(keys, matrix.zeros(0, kv_hidden))
+    list.push(values, matrix.zeros(0, kv_hidden))
+  }
+
+  var out: List[Int] = []
+  let (first, k1, v1) = predict_next_kv(file, keys, values, prompt, 0)!
+  keys = k1
+  values = v1
+  list.push(out, first)
+  var pos = list.len(prompt)
+  var last = first
+  for _ in 0..(n_new - 1) {
+    let (next, k_upd, v_upd) = predict_next_kv(file, keys, values, [last], pos)!
+    keys = k_upd
+    values = v_upd
+    list.push(out, next)
+    last = next
+    pos = pos + 1
+  }
+  ok(out)
+}
+
 // Allow a host-callable smoke entry that doesn't require a model (useful
 // to verify the build + linkage before downloading 248 MB).
 fn wasm_health_check() -> Int = 42
