@@ -1,0 +1,66 @@
+// Trace intermediate values in blk.0 forward to find where computation drops to zero.
+
+import nn.gguf as gguf
+import nn.qwen3 as q3
+
+fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
+  match list.find(file.tensors, (t) => t.name == name) {
+    some(t) => ok(t),
+    none => err("not found: " + name),
+  }
+
+fn sample(m: Matrix, label: String) -> () = {
+  let (r, c) = matrix.shape(m)
+  let rows = matrix.to_lists(m)
+  let row0 = list.get_or(rows, 0, [])
+  let first4 = list.take(row0, 4)
+    |> list.map((v) => float.to_string(v))
+    |> list.join(", ")
+  let sum_abs = row0 |> list.fold(0.0, (acc, v) => acc + float.abs(v))
+  println(label + " shape=" + int.to_string(r) + "x" + int.to_string(c)
+    + "  first4=[" + first4 + "]"
+    + "  sum|.|=" + float.to_string(sum_abs))
+}
+
+effect fn main() -> Unit = {
+  let file = gguf.load("weights/Bonsai-1.7B-Q1_0.gguf")!
+
+  let hidden = 2048
+  let n_q_heads = 16
+  let n_kv_heads = 8
+  let head_dim = 128
+  let rope_theta = 1000000.0
+  let eps = 0.000001
+
+  let wk = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.attn_k.weight")!)
+  let wv = gguf.extract_q1_0_matrix(file, find_tensor(file, "blk.0.attn_v.weight")!)
+  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "blk.0.attn_norm.weight")!)
+  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "blk.0.attn_k_norm.weight")!)
+
+  println("=== weight shapes ===")
+  let (wk_r, wk_c) = matrix.shape(wk)
+  println("wk: " + int.to_string(wk_r) + "x" + int.to_string(wk_c))
+  let (wv_r, wv_c) = matrix.shape(wv)
+  println("wv: " + int.to_string(wv_r) + "x" + int.to_string(wv_c))
+  println("attn_norm_gamma len: " + int.to_string(list.len(attn_norm_gamma)))
+  println("k_norm_gamma len: " + int.to_string(list.len(k_norm_gamma)))
+
+  let row_vals = list.range(0, hidden)
+    |> list.map((i) => int.to_float(i % 7) * 0.1 - 0.3)
+  let x = matrix.from_lists([row_vals])
+
+  println("=== trace ===")
+  sample(x, "x input")
+  let h = matrix.rms_norm_rows(x, attn_norm_gamma, eps)
+  sample(h, "h = rms_norm(x)")
+  let k_proj = matrix.linear_row_no_bias(h, wk)
+  sample(k_proj, "k_proj = h @ wk")
+  let v_proj = matrix.linear_row_no_bias(h, wv)
+  sample(v_proj, "v_proj = h @ wv")
+  let k_normed = q3.per_head_rms_norm(k_proj, k_norm_gamma, n_kv_heads, eps)
+  sample(k_normed, "k_normed = per_head_rms(k_proj)")
+  let k_rot = q3.rope_rotate(k_normed, n_kv_heads, head_dim, rope_theta)
+  sample(k_rot, "k_rot = rope(k_normed)")
+  let k_full = q3.repeat_kv(k_rot, n_kv_heads, 2)
+  sample(k_full, "k_full = repeat_kv(k_rot)")
+}

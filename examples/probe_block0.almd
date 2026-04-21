@@ -56,9 +56,12 @@ effect fn main() -> Unit = {
 
   println("All weights loaded. Running qwen3_block...")
 
-  // Input: seq_len=1, hidden=2048 of ones. (Real inference would be an
-  // embedding lookup — we skip that for this probe.)
-  let x = matrix.ones(1, hidden)
+  // Input: seq_len=1, hidden=2048 with position-dependent pattern to
+  // disambiguate "residual passthrough" from "qwen3_block actually ran
+  // computation". If output ≠ input, the attn + FFN paths are nonzero.
+  let row_vals = list.range(0, hidden)
+    |> list.map((i) => int.to_float(i % 7) * 0.1 - 0.3)
+  let x = matrix.from_lists([row_vals])
   let y = q3.qwen3_block(
     x,
     attn_norm_gamma,
@@ -76,10 +79,18 @@ effect fn main() -> Unit = {
   // Sample first 8 values and scan for NaN.
   let out_rows = matrix.to_lists(y)
   let row0 = list.get_or(out_rows, 0, [])
-  let first8 = list.take(row0, 8)
+  let first8_out = list.take(row0, 8)
     |> list.map((v) => float.to_string(v))
     |> list.join(", ")
-  println("First 8 output values: " + first8)
+  println("First 8 input values:  " + (list.take(row_vals, 8)
+    |> list.map((v) => float.to_string(v))
+    |> list.join(", ")))
+  println("First 8 output values: " + first8_out)
+  // Max absolute delta between input and output across full row.
+  let max_delta = list.zip(row_vals, row0)
+    |> list.map((p) => float.abs(p.0 - p.1))
+    |> list.fold(0.0, (a, b) => if a > b then a else b)
+  println("Max |out - in|: " + float.to_string(max_delta))
 
   let nan_count = row0 |> list.filter((v) => float.is_nan(v)) |> list.len
   let inf_count = row0 |> list.filter((v) => float.is_infinite(v)) |> list.len
