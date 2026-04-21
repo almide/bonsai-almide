@@ -42,8 +42,8 @@
   </div>
   <div class="row">
     Max new tokens:
-    <input id="maxNew" type="number" value="12" min="1" max="30" style="width: 4em" />
-    <button id="sendBtn" disabled>Send (~10 s / token streaming)</button>
+    <input id="maxNew" type="number" value="20" min="1" max="60" style="width: 4em" />
+    <button id="sendBtn" disabled>Send (KV cache streaming)</button>
     <span id="runStatus" class="status">waiting for model…</span>
   </div>
   <div id="chat" class="chat"></div>
@@ -55,10 +55,12 @@
 </details>
 
 <p class="footer">
-  Each generated token re-runs a full 28-layer forward
-  (<code>predict_next</code>, streaming). ~10 s per token on M1 (no KV cache in this build — the KV path exists but needs a WASM allocator refactor before browser chat can go fast).
-  Each weight matrix stays packed in Q1_0 throughout via <code>matrix.linear_q1_0_row_no_bias</code>.
-  Model is cached in IndexedDB on first run; subsequent loads are instant.
+  Streaming KV cache: first call does full prompt eval (~10 s for a 5-token prompt), then each
+  generated token is one attention step over the cached K/V (<code>predict_step_kv_bytes</code>).
+  KV state round-trips through <code>List[Bytes]</code> between steps so the WASM bump allocator
+  stays flat — JS copies the caches out, <code>__heap_restore</code>s the scratch, and feeds them
+  back in. Each weight matrix stays packed in Q1_0 throughout via
+  <code>matrix.linear_q1_0_row_no_bias</code>. Model is cached in IndexedDB on first run.
 </p>
 
 <script type="module">
@@ -140,6 +142,68 @@ function readResultInt(rp) {
     throw new Error('Almide err: ' + new TextDecoder().decode(new Uint8Array(wasmMemory.buffer, payload + 4, l)));
   }
   return Number(v.getBigInt64((rp >>> 0) + 4, true));
+}
+
+// Read Result[(Int, List[Bytes], List[Bytes]), String]. Memory may grow
+// during the call, so rebind DataView after every pointer follow. The
+// returned kv bytes are copied into fresh ArrayBuffers so they survive
+// __heap_restore.
+function readResultTupleIntKV(rp) {
+  let v = new DataView(wasmMemory.buffer);
+  const tag = v.getInt32(rp, true);
+  if (tag !== 0) {
+    const errPtr = v.getInt32(rp + 4, true) >>> 0;
+    const el = v.getInt32(errPtr, true);
+    throw new Error('Almide err: ' + new TextDecoder().decode(new Uint8Array(wasmMemory.buffer, errPtr + 4, el)));
+  }
+  const tuplePtr = v.getInt32(rp + 4, true) >>> 0;
+  v = new DataView(wasmMemory.buffer);
+  const nextTok = Number(v.getBigInt64(tuplePtr, true));
+  const keysListPtr = v.getInt32(tuplePtr + 8, true) >>> 0;
+  const valuesListPtr = v.getInt32(tuplePtr + 12, true) >>> 0;
+  return {
+    next: nextTok,
+    keys: copyBytesListOut(keysListPtr),
+    values: copyBytesListOut(valuesListPtr),
+  };
+}
+
+// Copy a List[Bytes] at `listPtr` into an Array<Uint8Array> owned by JS.
+function copyBytesListOut(listPtr) {
+  let v = new DataView(wasmMemory.buffer);
+  const len = v.getInt32(listPtr, true);
+  const out = [];
+  for (let i = 0; i < len; i++) {
+    v = new DataView(wasmMemory.buffer);
+    const bp = v.getInt32(listPtr + 4 + i * 4, true) >>> 0;
+    const bl = v.getInt32(bp, true);
+    const copy = new Uint8Array(bl);
+    copy.set(new Uint8Array(wasmMemory.buffer, bp + 4, bl));
+    out.push(copy);
+  }
+  return out;
+}
+
+// Allocate a List[Bytes] in WASM memory from an Array<Uint8Array>.
+// Each Bytes gets its own alloc; the outer list stores their pointers.
+function writeBytesList(arrs) {
+  const { __alloc } = wasmInstance.exports;
+  const bytesPtrs = new Array(arrs.length);
+  for (let i = 0; i < arrs.length; i++) {
+    const a = arrs[i];
+    const p = __alloc(4 + a.length) >>> 0;
+    const v = new DataView(wasmMemory.buffer);
+    v.setInt32(p, a.length, true);
+    new Uint8Array(wasmMemory.buffer, p + 4, a.length).set(a);
+    bytesPtrs[i] = p;
+  }
+  const listPtr = __alloc(4 + bytesPtrs.length * 4) >>> 0;
+  const v = new DataView(wasmMemory.buffer);
+  v.setInt32(listPtr, bytesPtrs.length, true);
+  for (let i = 0; i < bytesPtrs.length; i++) {
+    v.setInt32(listPtr + 4 + i * 4, bytesPtrs[i], true);
+  }
+  return listPtr;
 }
 
 // Read Result[List[Int], String]. Memory may have grown during the call,
@@ -231,7 +295,7 @@ $('sendBtn').addEventListener('click', async () => {
   if (!modelPtr || !tokenizer) return;
   $('sendBtn').disabled = true;
   const prompt = $('promptInput').value;
-  const nNew = Math.min(30, Math.max(1, parseInt($('maxNew').value, 10)));
+  const nNew = Math.min(60, Math.max(1, parseInt($('maxNew').value, 10)));
   const chatEl = $('chat');
   try {
     runStatus('tokenising prompt…');
@@ -242,35 +306,65 @@ $('sendBtn').addEventListener('click', async () => {
     chatEl.innerHTML = '<span class="user">' + prompt + '</span><span class="ai"></span>';
     const aiEl = chatEl.querySelector('.ai');
 
-    // Streaming path: one predict_next call per token, with __heap_restore
-    // between steps so the WASM bump allocator stays flat. KV-cache path
-    // is in the binary (predict_next_kv / predict_tokens_kv) but the
-    // browser demo doesn't use it yet — the heap-layout refactor required
-    // to cache across JS boundaries while reclaiming scratch is a separate
-    // arc (see bench/README.md roadmap).
-    const { __heap_save, __heap_restore } = wasmInstance.exports;
+    const {
+      __heap_save, __heap_restore,
+      predict_prompt_kv_bytes, predict_step_kv_bytes,
+    } = wasmInstance.exports;
     const sessionMark = __heap_save() >>> 0;
 
-    const context = [...tokens];
-    const generated = [];
-    let totalElapsed = 0;
-    for (let step = 0; step < nNew; step++) {
-      runStatus(`generating token ${step + 1}/${nNew} (context ${context.length} tokens, ~10 s each)…`);
+    // Prompt eval: full 28-layer forward over `tokens`, KV cache produced
+    // as List[Bytes] per layer. JS copies the caches out to ArrayBuffers,
+    // then __heap_restores the bump allocator so the next step starts
+    // with a flat heap.
+    runStatus(`prompt eval (${tokens.length} tokens)…`);
+    await new Promise((r) => setTimeout(r, 30));
+    const promptListPtr = writeTokenList(tokens);
+    const t0 = performance.now();
+    const rp0 = predict_prompt_kv_bytes(modelPtr, promptListPtr);
+    const { next: firstTok, keys: keys0, values: values0 } = readResultTupleIntKV(rp0);
+    const promptElapsed = performance.now() - t0;
+    __heap_restore(sessionMark);
+
+    const generated = [firstTok];
+    aiEl.textContent = tokenizer.decode(generated, { skip_special_tokens: false });
+    const bytesPerLayer = keys0[0] ? keys0[0].length : 0;
+    log(`  prompt eval: next tok ${firstTok} in ${(promptElapsed / 1000).toFixed(1)}s (${keys0.length} layers × ${bytesPerLayer} B/layer = ${(keys0.length * bytesPerLayer / 1024 / 1024).toFixed(2)} MB kv)`);
+
+    // Streaming steps: per-token, feed the JS-owned kv bytes back into
+    // WASM, call predict_step_kv_bytes, copy the updated kv bytes out
+    // again, __heap_restore. 1-token-at-a-time attention → ~1-2 s each
+    // instead of the non-KV path's ~10 s.
+    let totalElapsed = promptElapsed;
+    let pos = tokens.length;
+    let lastTok = firstTok;
+    let curKeys = keys0;
+    let curValues = values0;
+    for (let step = 1; step < nNew; step++) {
+      runStatus(`streaming token ${step + 1}/${nNew} (pos ${pos})…`);
       await new Promise((r) => setTimeout(r, 30));
-      const tokensPtr = writeTokenList(context);
-      const t0 = performance.now();
-      const rp = wasmInstance.exports.predict_next(modelPtr, tokensPtr);
-      const next = readResultInt(rp);
-      const elapsed = performance.now() - t0;
+      const keysListPtr = writeBytesList(curKeys);
+      const valuesListPtr = writeBytesList(curValues);
+      const ts = performance.now();
+      const rpi = predict_step_kv_bytes(
+        modelPtr,
+        keysListPtr,
+        valuesListPtr,
+        BigInt(lastTok),
+        BigInt(pos),
+      );
+      const { next, keys: nk, values: nv } = readResultTupleIntKV(rpi);
+      const elapsed = performance.now() - ts;
       totalElapsed += elapsed;
       __heap_restore(sessionMark);
-      context.push(next);
+      curKeys = nk;
+      curValues = nv;
+      lastTok = next;
+      pos += 1;
       generated.push(next);
-      const partial = tokenizer.decode(generated, { skip_special_tokens: false });
-      aiEl.textContent = partial;
-      log(`  step ${step + 1}: token ${next} → ${JSON.stringify(tokenizer.decode([next]))} in ${(elapsed / 1000).toFixed(1)}s`);
+      aiEl.textContent = tokenizer.decode(generated, { skip_special_tokens: false });
+      log(`  step ${step}: token ${next} → ${JSON.stringify(tokenizer.decode([next]))} in ${(elapsed / 1000).toFixed(1)}s`);
     }
-    runStatus(`done — ${nNew} tokens in ${(totalElapsed / 1000).toFixed(1)}s total (${(totalElapsed / nNew / 1000).toFixed(1)}s / token).`, 'ok');
+    runStatus(`done — ${generated.length} tokens in ${(totalElapsed / 1000).toFixed(1)}s total (${(totalElapsed / generated.length / 1000).toFixed(1)}s / token).`, 'ok');
   } catch (err) {
     runStatus('error: ' + err.message, 'error');
     log('ERROR: ' + (err.stack || err));

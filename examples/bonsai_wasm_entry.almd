@@ -296,6 +296,62 @@ effect fn predict_next_kv(
   ok((best_id, new_keys, new_values))
 }
 
+// ── JS-streaming-friendly entries ───────────────────────────────────
+//
+// `predict_prompt_kv_bytes` / `predict_step_kv_bytes` are the entries
+// the browser demo uses to stream tokens with KV cache while keeping
+// the Almide bump allocator flat between steps. The KV state round-
+// trips through plain `List[Bytes]` (each element is the f64 LE dump
+// of that layer's cache matrix) so JS can copy it out to an
+// ArrayBuffer, `__heap_restore` the scratch, and feed the cache back
+// in for the next step. Shape isn't carried — `kv_hidden = 1024` is
+// constant and `rows = bytes.len(b) / 8 / kv_hidden`.
+effect fn predict_prompt_kv_bytes(
+  model_bytes: Bytes,
+  prompt: List[Int],
+) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
+  let file = gguf.parse(model_bytes)!
+  let kv_hidden = 8 * 128
+  let n_layers = 28
+
+  var keys: List[Matrix] = []
+  var values: List[Matrix] = []
+  for _ in 0..n_layers {
+    list.push(keys, matrix.zeros(0, kv_hidden))
+    list.push(values, matrix.zeros(0, kv_hidden))
+  }
+
+  let (next, new_keys, new_values) = predict_next_kv(file, keys, values, prompt, 0)!
+  let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
+  let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
+  ok((next, k_bytes, v_bytes))
+}
+
+effect fn predict_step_kv_bytes(
+  model_bytes: Bytes,
+  kv_keys_bytes: List[Bytes],
+  kv_values_bytes: List[Bytes],
+  last_token: Int,
+  start_pos: Int,
+) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
+  let file = gguf.parse(model_bytes)!
+  let kv_hidden = 8 * 128
+
+  let keys = kv_keys_bytes |> list.map((b) => {
+    let rows = bytes.len(b) / 8 / kv_hidden
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+  })
+  let values = kv_values_bytes |> list.map((b) => {
+    let rows = bytes.len(b) / 8 / kv_hidden
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+  })
+
+  let (next, new_keys, new_values) = predict_next_kv(file, keys, values, [last_token], start_pos)!
+  let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
+  let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
+  ok((next, k_bytes, v_bytes))
+}
+
 // Single-shot KV-cache generation: prompt-eval + n_new gen steps with
 // the caches kept entirely Almide-side. Returns just the generated
 // token-id list (prompt not included). JS hosts can't easily reach
