@@ -50,6 +50,31 @@ effect fn main() -> Unit = {
             println("  LAYOUT OK: Q1_0 = 18 bytes per 128 weights")
           else
             println("  LAYOUT MISMATCH")
+
+          println("=== Q1_0 decode first block of blk.0.attn_k ===")
+          let block_start = file.data_offset + ak.offset
+          let (scale, weights) = gguf.decode_q1_0_block(file.raw, block_start)
+          println("  scale (fp16 -> fp32): " + float.to_string(scale))
+          let first8 = list.take(weights, 8)
+            |> list.map((v) => float.to_string(v))
+            |> list.join(", ")
+          println("  first 8 weights: " + first8)
+          var pos_count = 0
+          var neg_count = 0
+          var mismatch = 0
+          for w in weights {
+            if w == scale then { pos_count = pos_count + 1 }
+            else if w == (0.0 - scale) then { neg_count = neg_count + 1 }
+            else { mismatch = mismatch + 1 }
+          }
+          println("  +scale: " + int.to_string(pos_count)
+            + "  -scale: " + int.to_string(neg_count)
+            + "  other: " + int.to_string(mismatch)
+            + "  (total should be 128)")
+          if mismatch == 0 and pos_count + neg_count == 128 then
+            println("  Q1_0 DECODE OK")
+          else
+            println("  Q1_0 DECODE MISMATCH")
         },
         none => println("  blk.0.attn_k.weight not found"),
       }
