@@ -16,12 +16,12 @@
   .error { color: #c33; }
   .ok { color: #282; }
   .row { margin: 0.4em 0; }
-  input[type=file], textarea { width: 100%; box-sizing: border-box; }
-  textarea { font: inherit; padding: 0.6em; }
+  textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 0.6em; }
   .chat { border: 1px solid #ddd; padding: 0.8em; border-radius: 6px; min-height: 60px; background: #fbfbfd; font-size: 15px; line-height: 1.6; white-space: pre-wrap; }
   .chat .user { color: #333; }
   .chat .ai { color: #145; background: #eef3fa; padding: 0.2em 0.4em; border-radius: 3px; }
-  .pill { display: inline-block; padding: 0.1em 0.6em; border-radius: 999px; background: #eef; color: #335; margin-right: 0.4em; font-size: 0.85em; }
+  .progress { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; margin: 0.4em 0; }
+  .progress > div { height: 100%; background: #4a9; width: 0%; transition: width 0.2s; }
   .footer { color: #888; font-size: 0.85em; margin-top: 1em; }
 </style>
 </head>
@@ -30,16 +30,13 @@
 <p class="sub">Bonsai 1-bit LLM (1.7B, Qwen3 arch) compiled from <a href="https://github.com/almide/almide">Almide</a> to WebAssembly. Pure Almide inference — not a JS ML framework wrapper.</p>
 
 <fieldset>
-  <legend>1. Load the Bonsai weights</legend>
-  <div class="row">Pick <code>Bonsai-1.7B-Q1_0.gguf</code> (248 MB)
-    from <a href="https://huggingface.co/prism-ml/Bonsai-1.7B-gguf" target="_blank">Hugging Face</a>:<br>
-    <input id="fileInput" type="file" accept=".gguf" />
-  </div>
-  <div id="modelStatus" class="status">not loaded</div>
+  <legend>Startup</legend>
+  <div id="bootStatus" class="status">initialising…</div>
+  <div class="progress"><div id="bootBar"></div></div>
 </fieldset>
 
 <fieldset>
-  <legend>2. Chat</legend>
+  <legend>Chat</legend>
   <div class="row">
     <textarea id="promptInput" rows="2" placeholder="Type a prompt, e.g. 'The capital of Japan is'">The capital of Japan is</textarea>
   </div>
@@ -47,7 +44,7 @@
     Max new tokens:
     <input id="maxNew" type="number" value="6" min="1" max="30" style="width: 4em" />
     <button id="sendBtn" disabled>Send (~10 s / token)</button>
-    <span id="runStatus" class="status">load the GGUF first.</span>
+    <span id="runStatus" class="status">waiting for model…</span>
   </div>
   <div id="chat" class="chat"></div>
 </fieldset>
@@ -60,9 +57,8 @@
 <p class="footer">
   Each generated token re-runs a full 28-layer forward
   (<code>predict_next</code>, ~10 s at seq_len 5) — no KV cache yet, so a 10-token reply is ~2 min.
-  Each weight matrix stays packed in Q1_0 throughout via <code>matrix.linear_q1_0_row_no_bias</code>,
-  keeping peak memory inside WASM32's 4 GB address space.
-  Results are byte-identical to the PrismML <code>llama.cpp</code> fork on the same prompt.
+  Each weight matrix stays packed in Q1_0 throughout via <code>matrix.linear_q1_0_row_no_bias</code>.
+  Model is cached in IndexedDB on first run; subsequent loads are instant.
 </p>
 
 <script type="module">
@@ -72,10 +68,67 @@ import { AutoTokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/[email 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
 const log = (msg) => { logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight; };
-const modelStatus = (msg, cls) => { const el = $('modelStatus'); el.textContent = msg; el.className = 'status' + (cls ? ' ' + cls : ''); };
+const bootStatus = (msg, cls) => { const el = $('bootStatus'); el.textContent = msg; el.className = 'status' + (cls ? ' ' + cls : ''); };
+const bootBar = (pct) => { $('bootBar').style.width = Math.max(0, Math.min(100, pct)) + '%'; };
 const runStatus = (msg, cls) => { const el = $('runStatus'); el.textContent = msg; el.className = 'status' + (cls ? ' ' + cls : ''); };
 
+const GGUF_URL = './bonsai.gguf';
+const IDB_NAME = 'bonsai-cache';
+const IDB_STORE = 'blobs';
+const IDB_KEY = 'bonsai-1.7b-q1_0';
+
 let wasmInstance = null, wasmMemory = null, modelPtr = 0, tokenizer = null;
+
+function openIdb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbGet(key) {
+  try {
+    const db = await openIdb();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  } catch { return null; }
+}
+async function idbSet(key, value) {
+  try {
+    const db = await openIdb();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const req = tx.objectStore(IDB_STORE).put(value, key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  } catch {}
+}
+
+async function fetchWithProgress(url, onProgress) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('fetch ' + url + ': HTTP ' + resp.status);
+  const total = Number(resp.headers.get('content-length') || 0);
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (total) onProgress(received, total);
+  }
+  const buf = new Uint8Array(received);
+  let offset = 0;
+  for (const c of chunks) { buf.set(c, offset); offset += c.length; }
+  return buf;
+}
 
 function readResultInt(rp) {
   const v = new DataView(wasmMemory.buffer);
@@ -99,50 +152,58 @@ function writeTokenList(tokens) {
   return ptr;
 }
 
-async function loadTokenizer() {
-  if (tokenizer) return tokenizer;
-  modelStatus('loading Qwen3 tokenizer (from HF hub, first time ~1-2 MB)…');
-  tokenizer = await AutoTokenizer.from_pretrained('Qwen/Qwen3-1.7B');
-  log('tokenizer ready');
-  return tokenizer;
-}
-
-$('fileInput').addEventListener('change', async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
+async function boot() {
   try {
-    modelStatus('reading ' + (file.size / 1024 / 1024).toFixed(1) + ' MB…');
-    const modelBuf = new Uint8Array(await file.arrayBuffer());
-    log('file read: ' + modelBuf.length + ' bytes');
+    // WASM
+    bootStatus('loading WASM runtime…'); bootBar(5);
+    const wasmBuf = await (await fetch('./bonsai.wasm')).arrayBuffer();
+    const wasi = makeWasi({ stdout: (s) => log('[out] ' + s), stderr: (s) => log('[err] ' + s) });
+    const { instance } = await WebAssembly.instantiate(wasmBuf, wasi.imports);
+    wasi.setMemory(instance.exports.memory);
+    if (instance.exports._initialize) instance.exports._initialize();
+    wasmInstance = instance;
+    wasmMemory = instance.exports.memory;
+    log('WASM instantiated; health = ' + instance.exports.wasm_health_check());
+    bootBar(15);
 
-    if (!wasmInstance) {
-      modelStatus('instantiating WASM…');
-      const wasmBuf = await (await fetch('./bonsai.wasm')).arrayBuffer();
-      const wasi = makeWasi({ stdout: (s) => log('[out] ' + s), stderr: (s) => log('[err] ' + s) });
-      const { instance } = await WebAssembly.instantiate(wasmBuf, wasi.imports);
-      wasi.setMemory(instance.exports.memory);
-      if (instance.exports._initialize) instance.exports._initialize();
-      wasmInstance = instance;
-      wasmMemory = instance.exports.memory;
-      log('WASM instantiated; health = ' + instance.exports.wasm_health_check());
+    // Model
+    let modelBuf = await idbGet(IDB_KEY);
+    if (modelBuf) {
+      bootStatus('loading cached Bonsai from IndexedDB…'); bootBar(60);
+      log('using IndexedDB cache (' + (modelBuf.byteLength / 1024 / 1024).toFixed(1) + ' MB)');
+    } else {
+      bootStatus('downloading Bonsai weights (~248 MB)…'); bootBar(20);
+      modelBuf = await fetchWithProgress(GGUF_URL, (r, t) => {
+        const pct = 20 + Math.floor(60 * r / t);
+        bootBar(pct);
+        bootStatus('downloading Bonsai weights (' + (r / 1024 / 1024).toFixed(1) + ' / ' + (t / 1024 / 1024).toFixed(1) + ' MB)…');
+      });
+      log('downloaded ' + modelBuf.byteLength + ' bytes');
+      await idbSet(IDB_KEY, modelBuf);
+      log('cached to IndexedDB');
     }
-
-    modelStatus('writing model into WASM memory…');
+    bootBar(80);
+    bootStatus('writing weights into WASM memory (~2.5 GB heap growth)…');
     const { __alloc } = wasmInstance.exports;
-    modelPtr = (__alloc(4 + modelBuf.length) >>> 0);
-    new DataView(wasmMemory.buffer).setInt32(modelPtr, modelBuf.length, true);
-    new Uint8Array(wasmMemory.buffer).set(modelBuf, modelPtr + 4);
+    modelPtr = (__alloc(4 + modelBuf.byteLength) >>> 0);
+    new DataView(wasmMemory.buffer).setInt32(modelPtr, modelBuf.byteLength, true);
+    new Uint8Array(wasmMemory.buffer).set(new Uint8Array(modelBuf), modelPtr + 4);
     log('model written at ptr=' + modelPtr);
+    bootBar(90);
 
-    await loadTokenizer();
-    modelStatus('ready (' + (modelBuf.length / 1024 / 1024).toFixed(1) + ' MB model + tokenizer).', 'ok');
+    // Tokenizer
+    bootStatus('loading Qwen3 tokenizer…');
+    tokenizer = await AutoTokenizer.from_pretrained('Qwen/Qwen3-1.7B');
+    log('tokenizer ready');
+    bootBar(100);
+    bootStatus('ready — type a prompt and press Send.', 'ok');
     $('sendBtn').disabled = false;
-    runStatus('ready — type a prompt and press Send.');
+    runStatus('ready.');
   } catch (err) {
-    modelStatus('error: ' + err.message, 'error');
-    log('ERROR: ' + (err.stack || err));
+    bootStatus('startup failed: ' + err.message, 'error');
+    log('BOOT ERROR: ' + (err.stack || err));
   }
-});
+}
 
 $('sendBtn').addEventListener('click', async () => {
   if (!modelPtr || !tokenizer) return;
@@ -150,7 +211,6 @@ $('sendBtn').addEventListener('click', async () => {
   const prompt = $('promptInput').value;
   const nNew = Math.min(30, Math.max(1, parseInt($('maxNew').value, 10)));
   const chatEl = $('chat');
-
   try {
     runStatus('tokenising prompt…');
     const encoded = await tokenizer(prompt, { add_special_tokens: false });
@@ -178,9 +238,7 @@ $('sendBtn').addEventListener('click', async () => {
       aiEl.textContent = partial;
       log(`  step ${step + 1}: token ${next} → ${JSON.stringify(tokenizer.decode([next]))} in ${(elapsed / 1000).toFixed(1)}s`);
     }
-    const finalText = tokenizer.decode(generated, { skip_special_tokens: false });
     runStatus(`done — ${nNew} tokens in ${(totalElapsed / 1000).toFixed(1)}s total (${(totalElapsed / nNew / 1000).toFixed(1)}s / token).`, 'ok');
-    log('final: ' + finalText);
   } catch (err) {
     runStatus('error: ' + err.message, 'error');
     log('ERROR: ' + (err.stack || err));
@@ -188,6 +246,8 @@ $('sendBtn').addEventListener('click', async () => {
     $('sendBtn').disabled = false;
   }
 });
+
+boot();
 </script>
 </body>
 </html>
