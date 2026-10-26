@@ -87,7 +87,7 @@ effect fn predict_next(file: gguf.GGUFFile, tokens: List[Int]) -> Result[Int, St
   let embd_offset = file.data_offset + embd_info.offset
   var h = kernels.select_rows_q1_0(file.raw, embd_offset, embd_cols, tokens)
 
-  for layer in 0..n_layers {
+  for layer in 0..<n_layers {
     h = run_layer_q1_0(file, h, layer,
       n_q_heads, n_kv_heads, head_dim, ffn_hidden, rope_theta, eps)!
   }
@@ -135,7 +135,7 @@ effect fn main() -> Result[Unit, String] = {
   list.push(ctx, first)
 
   let t_g0 = datetime.monotonic_ns()
-  for _ in 0..(n_gen - 1) {
+  for _ in 0..<(n_gen - 1) {
     let next = step(file, ctx)!
     list.push(ctx, next)
   }

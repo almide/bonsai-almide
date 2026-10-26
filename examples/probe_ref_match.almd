@@ -85,7 +85,7 @@ effect fn main() -> Unit = {
 
   // 28-layer forward.
   let t_fwd_start = datetime.monotonic_ns()
-  for layer in 0..n_layers {
+  for layer in 0..<n_layers {
     h = run_layer(file, h, layer, n_q_heads, n_kv_heads, head_dim, rope_theta, eps)!
   }
   let t_fwd_end = datetime.monotonic_ns()

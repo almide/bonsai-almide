@@ -86,7 +86,7 @@ effect fn main() -> Unit = {
   let (init_sum, init_max) = row_stats(h)
   println("input: sum|.|=" + float.to_string(init_sum) + " max|.|=" + float.to_string(init_max))
 
-  for layer in 0..n_layers {
+  for layer in 0..<n_layers {
     println("[layer " + int.to_string(layer) + "/" + int.to_string(n_layers) + "] extracting + forward...")
     h = run_layer(file, h, layer, n_q_heads, n_kv_heads, head_dim, rope_theta, eps)!
     let (s, m) = row_stats(h)

@@ -133,7 +133,7 @@ effect fn predict_next(model_bytes: Bytes, tokens: List[Int]) -> Result[Int, Str
   let embd_offset = file.data_offset + embd_info.offset
   var h = kernels.select_rows_q1_0(file.raw, embd_offset, embd_cols, tokens)
 
-  for layer in 0..n_layers {
+  for layer in 0..<n_layers {
     h = run_layer_q1_0(file, h, layer,
       n_q_heads, n_kv_heads, head_dim, ffn_hidden, rope_theta, eps)!
   }
@@ -166,7 +166,7 @@ effect fn predict_next(model_bytes: Bytes, tokens: List[Int]) -> Result[Int, Str
 effect fn predict_tokens(model_bytes: Bytes, tokens: List[Int], n_new: Int) -> Result[List[Int], String] = {
   var context = tokens
   var out: List[Int] = []
-  for _ in 0..n_new {
+  for _ in 0..<n_new {
     let next = predict_next(model_bytes, context)!
     list.push(out, next)
     list.push(context, next)
@@ -368,7 +368,7 @@ effect fn predict_next_kv(
   var new_keys = list.take(kv_keys, list.len(kv_keys))
   var new_values = list.take(kv_values, list.len(kv_values))
 
-  for layer in 0..n_layers {
+  for layer in 0..<n_layers {
     let k_cache = list.get(kv_keys, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
     let v_cache = list.get(kv_values, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
     let (h_next, k_new, v_new) = run_layer_q1_0_kv(
@@ -422,7 +422,7 @@ effect fn predict_prompt_kv_cached(
 
   var keys: List[Matrix] = []
   var values: List[Matrix] = []
-  for _ in 0..n_layers {
+  for _ in 0..<n_layers {
     list.push(keys, matrix.zeros(0, kv_hidden))
     list.push(values, matrix.zeros(0, kv_hidden))
   }
@@ -452,11 +452,11 @@ effect fn predict_step_kv_cached(
 
   let keys = kv_keys_bytes |> list.map((b) => {
     let rows = bytes.len(b) / 8 / kv_hidden
-    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden) ?? matrix.zeros(rows, kv_hidden)
   })
   let values = kv_values_bytes |> list.map((b) => {
     let rows = bytes.len(b) / 8 / kv_hidden
-    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden) ?? matrix.zeros(rows, kv_hidden)
   })
 
   let (next, new_keys, new_values) = predict_next_kv(
@@ -482,7 +482,7 @@ effect fn predict_prompt_kv_bytes(
 
   var keys: List[Matrix] = []
   var values: List[Matrix] = []
-  for _ in 0..n_layers {
+  for _ in 0..<n_layers {
     list.push(keys, matrix.zeros(0, kv_hidden))
     list.push(values, matrix.zeros(0, kv_hidden))
   }
@@ -513,11 +513,11 @@ effect fn predict_step_kv_bytes(
 
   let keys = kv_keys_bytes |> list.map((b) => {
     let rows = bytes.len(b) / 8 / kv_hidden
-    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden) ?? matrix.zeros(rows, kv_hidden)
   })
   let values = kv_values_bytes |> list.map((b) => {
     let rows = bytes.len(b) / 8 / kv_hidden
-    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden) ?? matrix.zeros(rows, kv_hidden)
   })
 
   let (next, new_keys, new_values) = predict_next_kv(
@@ -545,7 +545,7 @@ effect fn probe_prompt_then_step(
 
   var keys: List[Matrix] = []
   var values: List[Matrix] = []
-  for _ in 0..n_layers {
+  for _ in 0..<n_layers {
     list.push(keys, matrix.zeros(0, kv_hidden))
     list.push(values, matrix.zeros(0, kv_hidden))
   }
@@ -571,7 +571,7 @@ effect fn predict_tokens_kv(model_bytes: Bytes, prompt: List[Int], n_new: Int) -
 
   var keys: List[Matrix] = []
   var values: List[Matrix] = []
-  for _ in 0..n_layers {
+  for _ in 0..<n_layers {
     list.push(keys, matrix.zeros(0, kv_hidden))
     list.push(values, matrix.zeros(0, kv_hidden))
   }
@@ -583,7 +583,7 @@ effect fn predict_tokens_kv(model_bytes: Bytes, prompt: List[Int], n_new: Int) -
   list.push(out, first)
   var pos = list.len(prompt)
   var last = first
-  for _ in 0..(n_new - 1) {
+  for _ in 0..<(n_new - 1) {
     let (next, k_upd, v_upd) = predict_next_kv(file, keys, values, [last], pos, 0.0, 1, 0.0, [], 1.0)!
     keys = k_upd
     values = v_upd
@@ -668,7 +668,7 @@ effect fn extract_attn_k_first_value(model_bytes: Bytes) -> Result[Float, String
   match list.find(file.tensors, (t) => t.name == "blk.0.attn_k.weight") {
     some(info) => {
       let m = gguf.extract_q1_0_matrix(file, info)
-      ok(matrix.get(m, 0, 0))
+      ok(matrix.get(m, 0, 0) ?? panic("matrix.get: out of range"))
     },
     none => err("blk.0.attn_k.weight not found"),
   }
@@ -694,7 +694,7 @@ effect fn extract_token_embd_first(model_bytes: Bytes) -> Result[Float, String] 
   match list.find(file.tensors, (t) => t.name == "token_embd.weight") {
     some(info) => {
       let m = gguf.extract_q1_0_matrix(file, info)
-      ok(matrix.get(m, 0, 0))
+      ok(matrix.get(m, 0, 0) ?? panic("matrix.get: out of range"))
     },
     none => err("token_embd not found"),
   }
@@ -712,5 +712,5 @@ effect fn one_layer_first_value(model_bytes: Bytes, tokens: List[Int]) -> Result
   let token_embd = gguf.extract_q1_0_matrix(file, find_tensor(file, "token_embd.weight")!)
   let h_input = matrix.gather_rows(token_embd, list.map(tokens, (i) => int.max(i, 0)))
   let h_out = run_layer(file, h_input, 0, n_q_heads, n_kv_heads, head_dim, rope_theta, eps)!
-  ok(matrix.get(h_out, 0, 0))
+  ok(matrix.get(h_out, 0, 0) ?? panic("matrix.get: out of range"))
 }

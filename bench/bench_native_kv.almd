@@ -102,7 +102,7 @@ effect fn predict_next_kv(
   var new_keys = list.take(kv_keys, list.len(kv_keys))
   var new_values = list.take(kv_values, list.len(kv_values))
 
-  for layer in 0..n_layers {
+  for layer in 0..<n_layers {
     let k_cache = list.get(new_keys, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
     let v_cache = list.get(new_values, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
     let (h_next, k_new, v_new) = run_layer_q1_0_kv(
@@ -155,7 +155,7 @@ effect fn main() -> Result[Unit, String] = {
   // Initialise 28-slot zero-row caches (each layer's running K/V).
   var keys: List[Matrix] = []
   var values: List[Matrix] = []
-  for _ in 0..n_layers {
+  for _ in 0..<n_layers {
     list.push(keys, matrix.zeros(0, kv_hidden))
     list.push(values, matrix.zeros(0, kv_hidden))
   }
@@ -177,7 +177,7 @@ effect fn main() -> Result[Unit, String] = {
   var last = first
   var pos = prompt_len
   let t_g0 = datetime.monotonic_ns()
-  for _ in 0..(n_gen - 1) {
+  for _ in 0..<(n_gen - 1) {
     let (next, k_upd, v_upd) = step(file, keys, values, [last], pos)!
     keys = k_upd
     values = v_upd

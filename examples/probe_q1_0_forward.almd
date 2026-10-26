@@ -94,7 +94,7 @@ effect fn main() -> Unit = {
   println("embedding lookup: " + int.to_string((t_embd_end - t_embd_start) / 1000000) + " ms")
 
   let t_fwd_start = datetime.monotonic_ns()
-  for layer in 0..n_layers {
+  for layer in 0..<n_layers {
     h = run_layer_q1_0(file, h, layer, n_q_heads, n_kv_heads, head_dim, ffn_hidden, rope_theta, eps)!
   }
   let t_fwd_end = datetime.monotonic_ns()
