@@ -2,7 +2,7 @@
 // `linear_q1_0_row_no_bias(x, packed_bytes, ...)` on blk.0.attn_q.
 
 import nn.gguf as gguf
-import nnlib
+import nn.kernels
 
 fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
   match list.find(file.tensors, (t) => t.name == name) {
@@ -25,10 +25,10 @@ effect fn main() -> Unit = {
 
   // Path A: decode full matrix then linear.
   let w = gguf.extract_q1_0_matrix(file, info)
-  let y_decode = nnlib.linear_row_no_bias(x, w)
+  let y_decode = kernels.linear_row_no_bias(x, w)
 
   // Path B: direct Q1_0 matmul.
-  let y_direct = nnlib.linear_q1_0_row_no_bias(x, file.raw, offset, rows, cols)
+  let y_direct = kernels.linear_q1_0_row_no_bias(x, file.raw, offset, rows, cols)
 
   let a = list.get(matrix.to_lists(y_decode), 0) ?? []
   let b = list.get(matrix.to_lists(y_direct), 0) ?? []

@@ -4,4 +4,7 @@ version = "0.2.0"
 description = "Bonsai 1-bit LLM inference in Almide — AOT compiled, native + WASM"
 
 [dependencies]
-nn = { git = "file:///Users/o6lvl4/workspace/github.com/almide/nn" }
+nn = { git = "https://github.com/almide-graphics/nn", tag = "v0.2.0" }
+
+[trust]
+owners = ["github.com/almide-graphics"]
