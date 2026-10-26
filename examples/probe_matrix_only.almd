@@ -12,7 +12,7 @@ effect fn main() -> Unit = {
       let (r, c) = matrix.shape(m)
       println("  shape: " + int.to_string(r) + "x" + int.to_string(c))
       let rows = matrix.to_lists(m)
-      let row0 = list.get_or(rows, 0, [])
+      let row0 = list.get(rows, 0) ?? []
       let first4 = list.take(row0, 4) |> list.map((v) => float.to_string(v)) |> list.join(", ")
       println("  first 4: " + first4)
       println("EXTRACT OK")

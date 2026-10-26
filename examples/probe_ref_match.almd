@@ -12,6 +12,7 @@
 import nn.gguf as gguf
 import nn.qwen3 as q3
 import datetime
+import nnlib
 
 fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
   match list.find(file.tensors, (t) => t.name == name) {
@@ -77,7 +78,7 @@ effect fn main() -> Unit = {
 
   // Build input by row-lookup: embed each token id and stack.
   let embd_rows = matrix.to_lists(token_embd)
-  let input_rows = tokens |> list.map((id) => list.get_or(embd_rows, id, []))
+  let input_rows = tokens |> list.map((id) => list.get(embd_rows, id) ?? [])
   var h = matrix.from_lists(input_rows)
   let (seq_r, seq_c) = matrix.shape(h)
   println("input embeddings shape: " + int.to_string(seq_r) + " x " + int.to_string(seq_c))
@@ -92,14 +93,14 @@ effect fn main() -> Unit = {
 
   // Final output_norm + tied lm_head.
   let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
-  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
-  let logits = matrix.linear_row_no_bias(normed, token_embd)
+  let normed = nnlib.rms_norm_rows(h, output_norm_gamma, eps)
+  let logits = nnlib.linear_row_no_bias(normed, token_embd)
   let (lr, lc) = matrix.shape(logits)
   println("logits shape: " + int.to_string(lr) + " x " + int.to_string(lc))
 
   // Argmax on the LAST row (next-token prediction after the input prompt).
   let logit_lists = matrix.to_lists(logits)
-  let last_row = list.get_or(logit_lists, lr - 1, [])
+  let last_row = list.get(logit_lists, lr - 1) ?? []
   let (best_id, best_val) = last_row
     |> list.enumerate
     |> list.fold((0, -1000000000.0), (acc, entry) => {

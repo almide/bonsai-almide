@@ -9,6 +9,7 @@
 import nn.gguf as gguf
 import nn.qwen3 as q3
 import datetime
+import nnlib
 
 fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
   match list.find(file.tensors, (t) => t.name == name) {
@@ -53,7 +54,7 @@ effect fn run_layer(
 
 fn row_stats(m: Matrix) -> (Float, Float) = {
   let rows = matrix.to_lists(m)
-  let row0 = list.get_or(rows, 0, [])
+  let row0 = list.get(rows, 0) ?? []
   let sum_abs = row0 |> list.fold(0.0, (acc, v) => acc + float.abs(v))
   let max_abs = row0 |> list.fold(0.0, (acc, v) => {
     let a = float.abs(v)
@@ -79,7 +80,7 @@ effect fn main() -> Unit = {
   // (stand-in for an embedded token). Skips token_embd lookup for now —
   // we only care that 28 layers flow without blowup.
   let row_vals = list.range(0, hidden)
-    |> list.map((i) => int.to_float(i % 11) * 0.05 - 0.25)
+    |> list.map((i) => float.from(i % 11) * 0.05 - 0.25)
   var h = matrix.from_lists([row_vals])
 
   let (init_sum, init_max) = row_stats(h)
@@ -95,7 +96,7 @@ effect fn main() -> Unit = {
   // Final output_norm + tied lm_head.
   println("Final output_norm + tied lm_head...")
   let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
-  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
+  let normed = nnlib.rms_norm_rows(h, output_norm_gamma, eps)
   println("  output_norm done")
 
   // Tied lm_head: logits = normed @ token_embd^T. token_embd is
@@ -103,7 +104,7 @@ effect fn main() -> Unit = {
   // cols=in=2048). linear_row_no_bias(normed, token_embd) matches.
   let token_embd = gguf.extract_q1_0_matrix(file, find_tensor(file, "token_embd.weight")!)
   println("  token_embd decoded")
-  let logits = matrix.linear_row_no_bias(normed, token_embd)
+  let logits = nnlib.linear_row_no_bias(normed, token_embd)
   let (lr, lc) = matrix.shape(logits)
   println("  logits shape: " + int.to_string(lr) + " x " + int.to_string(lc))
 

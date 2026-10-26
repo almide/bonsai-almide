@@ -1,11 +1,12 @@
 // bench_native_kv_super — Almide ネイティブ tok/s 計測 (KV + super-intrinsic).
 //
-// Almide 側の layer loop を 1 呼び出し (matrix.qwen3_block_q1_0_kv)
+// Almide 側の layer loop を 1 呼び出し (nnlib.qwen3_block_q1_0_kv)
 // にまとめて、List[Matrix] の list.set / list.take オーバーヘッドを
 // 削る。Rust runtime 内で既存 matrix primitive を直接 chain 呼び。
 
 import nn.gguf as gguf
 import datetime
+import nnlib
 
 fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
   match list.find(file.tensors, (t) => t.name == name) {
@@ -74,7 +75,7 @@ effect fn predict_next_kv(
   let embd_cols = list.get(embd_info.dims, 0) |> option.unwrap_or(hidden)
   let embd_offset = base + embd_info.offset
 
-  var h = matrix.select_rows_q1_0(raw, embd_offset, embd_cols, new_tokens)
+  var h = nnlib.select_rows_q1_0(raw, embd_offset, embd_cols, new_tokens)
   var new_keys = list.take(kv_keys, list.len(kv_keys))
   var new_values = list.take(kv_values, list.len(kv_values))
 
@@ -82,7 +83,7 @@ effect fn predict_next_kv(
     let k_cache = list.get(new_keys, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
     let v_cache = list.get(new_values, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
     let (gamma_offs, weight_offs) = layer_offsets(tensors, base, layer)!
-    let (h_next, k_new, v_new) = matrix.qwen3_block_q1_0_kv(
+    let (h_next, k_new, v_new) = nnlib.qwen3_block_q1_0_kv(
       h, k_cache, v_cache, raw, gamma_offs, weight_offs,
       start_pos, n_q_heads, n_kv_heads, head_dim, ffn_hidden, rope_theta, eps,
     )
@@ -92,9 +93,9 @@ effect fn predict_next_kv(
   }
 
   let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
-  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
+  let normed = nnlib.rms_norm_rows(h, output_norm_gamma, eps)
   let vocab = list.get(embd_info.dims, 1) |> option.unwrap_or(1)
-  let logits = matrix.linear_q1_0_row_no_bias(normed, raw, embd_offset, vocab, embd_cols)
+  let logits = nnlib.linear_q1_0_row_no_bias(normed, raw, embd_offset, vocab, embd_cols)
 
   let (lr, _lc) = matrix.shape(logits)
   let last_row = matrix.to_lists(logits) |> list.get(lr - 1) |> option.unwrap_or([])

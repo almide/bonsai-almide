@@ -2,6 +2,7 @@
 
 import nn.gguf as gguf
 import nn.qwen3 as q3
+import nnlib
 
 fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
   match list.find(file.tensors, (t) => t.name == name) {
@@ -12,7 +13,7 @@ fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, Str
 fn sample(m: Matrix, label: String) -> () = {
   let (r, c) = matrix.shape(m)
   let rows = matrix.to_lists(m)
-  let row0 = list.get_or(rows, 0, [])
+  let row0 = list.get(rows, 0) ?? []
   let first4 = list.take(row0, 4)
     |> list.map((v) => float.to_string(v))
     |> list.join(", ")
@@ -46,16 +47,16 @@ effect fn main() -> Unit = {
   println("k_norm_gamma len: " + int.to_string(list.len(k_norm_gamma)))
 
   let row_vals = list.range(0, hidden)
-    |> list.map((i) => int.to_float(i % 7) * 0.1 - 0.3)
+    |> list.map((i) => float.from(i % 7) * 0.1 - 0.3)
   let x = matrix.from_lists([row_vals])
 
   println("=== trace ===")
   sample(x, "x input")
-  let h = matrix.rms_norm_rows(x, attn_norm_gamma, eps)
+  let h = nnlib.rms_norm_rows(x, attn_norm_gamma, eps)
   sample(h, "h = rms_norm(x)")
-  let k_proj = matrix.linear_row_no_bias(h, wk)
+  let k_proj = nnlib.linear_row_no_bias(h, wk)
   sample(k_proj, "k_proj = h @ wk")
-  let v_proj = matrix.linear_row_no_bias(h, wv)
+  let v_proj = nnlib.linear_row_no_bias(h, wv)
   sample(v_proj, "v_proj = h @ wv")
   let k_normed = q3.per_head_rms_norm(k_proj, k_norm_gamma, n_kv_heads, eps)
   sample(k_normed, "k_normed = per_head_rms(k_proj)")

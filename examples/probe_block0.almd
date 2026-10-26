@@ -60,7 +60,7 @@ effect fn main() -> Unit = {
   // disambiguate "residual passthrough" from "qwen3_block actually ran
   // computation". If output ≠ input, the attn + FFN paths are nonzero.
   let row_vals = list.range(0, hidden)
-    |> list.map((i) => int.to_float(i % 7) * 0.1 - 0.3)
+    |> list.map((i) => float.from(i % 7) * 0.1 - 0.3)
   let x = matrix.from_lists([row_vals])
   let y = q3.qwen3_block(
     x,
@@ -78,7 +78,7 @@ effect fn main() -> Unit = {
 
   // Sample first 8 values and scan for NaN.
   let out_rows = matrix.to_lists(y)
-  let row0 = list.get_or(out_rows, 0, [])
+  let row0 = list.get(out_rows, 0) ?? []
   let first8_out = list.take(row0, 8)
     |> list.map((v) => float.to_string(v))
     |> list.join(", ")
