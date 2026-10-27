@@ -13,7 +13,7 @@ fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, Str
     none => err("not found: " + name),
   }
 
-fn lap(label: String, t0: Int) -> Int = {
+effect fn lap(label: String, t0: Int) -> Int = {
   let t = datetime.monotonic_ns()
   let ms = (t - t0) / 1000000
   println(label + ": " + int.to_string(ms) + " ms")

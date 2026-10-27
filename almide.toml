@@ -8,3 +8,6 @@ nn = { git = "https://github.com/almide-graphics/nn", tag = "v0.2.0" }
 
 [trust]
 owners = ["github.com/almide-graphics"]
+
+[permissions]
+native = ["nn"]
