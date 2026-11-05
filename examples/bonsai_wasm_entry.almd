@@ -7,46 +7,83 @@
 // passes the byte buffer and token-id list in, gets back the argmax
 // next-token id. No IO inside WASM — the probe reads everything from
 // the supplied bytes.
-
 import nn.gguf as gguf
 import nn.qwen3 as q3
+import nn.kernels
 
-fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] =
-  match list.find(file.tensors, (t) => t.name == name) {
-    some(t) => ok(t),
-    none => err("tensor not found: " + name),
-  }
+fn find_tensor(file: gguf.GGUFFile, name: String) -> Result[gguf.TensorInfo, String] = match list.find(
+  file.tensors,
+  (t) => t.name == name,
+) {
+  some(t) => ok(t),
+  none => err("tensor not found: " + name),
+}
 
-fn block_tensor_name(layer: Int, suffix: String) -> String =
-  "blk." + int.to_string(layer) + "." + suffix
+fn block_tensor_name(layer: Int, suffix: String) -> String = "blk." + int.to_string(layer) + "." + suffix
 
-effect fn run_layer(
-  file: gguf.GGUFFile,
-  h: Matrix,
-  layer: Int,
-  n_q_heads: Int, n_kv_heads: Int, head_dim: Int,
-  rope_theta: Float, eps: Float,
-) -> Result[Matrix, String] = {
-  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!)
-  let q_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!)
-  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!)
-  let ffn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!)
-  let w_q = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_q.weight"))!)
-  let w_k = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_k.weight"))!)
-  let w_v = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_v.weight"))!)
-  let w_o = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "attn_output.weight"))!)
-  let w_gate = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_gate.weight"))!)
-  let w_up = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_up.weight"))!)
-  let w_down = gguf.extract_q1_0_matrix(file, find_tensor(file, block_tensor_name(layer, "ffn_down.weight"))!)
+effect fn run_layer(file: gguf.GGUFFile, h: Matrix, layer: Int, n_q_heads: Int, n_kv_heads: Int, head_dim: Int, rope_theta: Float, eps: Float) -> Result[Matrix, String] = {
+  let attn_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!,
+  )
+  let q_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!,
+  )
+  let k_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!,
+  )
+  let ffn_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!,
+  )
+  let w_q = gguf.extract_q1_0_matrix(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_q.weight"))!,
+  )
+  let w_k = gguf.extract_q1_0_matrix(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_k.weight"))!,
+  )
+  let w_v = gguf.extract_q1_0_matrix(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_v.weight"))!,
+  )
+  let w_o = gguf.extract_q1_0_matrix(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_output.weight"))!,
+  )
+  let w_gate = gguf.extract_q1_0_matrix(
+    file,
+    find_tensor(file, block_tensor_name(layer, "ffn_gate.weight"))!,
+  )
+  let w_up = gguf.extract_q1_0_matrix(
+    file,
+    find_tensor(file, block_tensor_name(layer, "ffn_up.weight"))!,
+  )
+  let w_down = gguf.extract_q1_0_matrix(
+    file,
+    find_tensor(file, block_tensor_name(layer, "ffn_down.weight"))!,
+  )
   ok(q3.qwen3_block(
     h,
     attn_norm_gamma,
-    w_q, w_k, w_v, w_o,
-    q_norm_gamma, k_norm_gamma,
+    w_q,
+    w_k,
+    w_v,
+    w_o,
+    q_norm_gamma,
+    k_norm_gamma,
     ffn_norm_gamma,
-    w_gate, w_up, w_down,
-    n_q_heads, n_kv_heads, head_dim,
-    rope_theta, eps,
+    w_gate,
+    w_up,
+    w_down,
+    n_q_heads,
+    n_kv_heads,
+    head_dim,
+    rope_theta,
+    eps,
   ))
 }
 
@@ -55,23 +92,26 @@ effect fn run_layer(
 // drops from ~400 MB (seven decoded f64 matrices) to a handful of MB
 // (activations only), which is what lets the full 28-layer forward
 // fit inside WASM's 4 GB address space.
-effect fn run_layer_q1_0(
-  file: gguf.GGUFFile,
-  h: Matrix,
-  layer: Int,
-  n_q_heads: Int, n_kv_heads: Int, head_dim: Int,
-  ffn_hidden: Int,
-  rope_theta: Float, eps: Float,
-) -> Result[Matrix, String] = {
+effect fn run_layer_q1_0(file: gguf.GGUFFile, h: Matrix, layer: Int, n_q_heads: Int, n_kv_heads: Int, head_dim: Int, ffn_hidden: Int, rope_theta: Float, eps: Float) -> Result[Matrix, String] = {
   let hidden = n_q_heads * head_dim
   let kv_hidden = n_kv_heads * head_dim
   let n_rep = n_q_heads / n_kv_heads
-
-  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!)
-  let q_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!)
-  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!)
-  let ffn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!)
-
+  let attn_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!,
+  )
+  let q_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!,
+  )
+  let k_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!,
+  )
+  let ffn_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!,
+  )
   let wq_info = find_tensor(file, block_tensor_name(layer, "attn_q.weight"))!
   let wk_info = find_tensor(file, block_tensor_name(layer, "attn_k.weight"))!
   let wv_info = find_tensor(file, block_tensor_name(layer, "attn_v.weight"))!
@@ -79,34 +119,51 @@ effect fn run_layer_q1_0(
   let wgate_info = find_tensor(file, block_tensor_name(layer, "ffn_gate.weight"))!
   let wup_info = find_tensor(file, block_tensor_name(layer, "ffn_up.weight"))!
   let wdown_info = find_tensor(file, block_tensor_name(layer, "ffn_down.weight"))!
-
   let base = file.data_offset
   let raw = file.raw
-
-  let h_normed = matrix.rms_norm_rows(h, attn_norm_gamma, eps)
-  let q_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wq_info.offset, hidden, hidden)
-  let k_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wk_info.offset, kv_hidden, hidden)
-  let v_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wv_info.offset, kv_hidden, hidden)
-
+  let h_normed = kernels.rms_norm_rows(h, attn_norm_gamma, eps)
+  let q_proj = kernels.linear_q1_0_row_no_bias(h_normed, raw, base + wq_info.offset, hidden, hidden)
+  let k_proj = kernels.linear_q1_0_row_no_bias(
+    h_normed,
+    raw,
+    base + wk_info.offset,
+    kv_hidden,
+    hidden,
+  )
+  let v_proj = kernels.linear_q1_0_row_no_bias(
+    h_normed,
+    raw,
+    base + wv_info.offset,
+    kv_hidden,
+    hidden,
+  )
   let q_normed = q3.per_head_rms_norm(q_proj, q_norm_gamma, n_q_heads, eps)
   let k_normed = q3.per_head_rms_norm(k_proj, k_norm_gamma, n_kv_heads, eps)
-
   let q_rot = q3.rope_rotate(q_normed, n_q_heads, head_dim, rope_theta)
   let k_rot = q3.rope_rotate(k_normed, n_kv_heads, head_dim, rope_theta)
-
   let k_full = q3.repeat_kv(k_rot, n_kv_heads, n_rep)
   let v_full = q3.repeat_kv(v_proj, n_kv_heads, n_rep)
-
-  let attn_out = matrix.masked_multi_head_attention(q_rot, k_full, v_full, n_q_heads)
-  let attn_proj = matrix.linear_q1_0_row_no_bias(attn_out, raw, base + wo_info.offset, hidden, hidden)
-  let x_attn = matrix.add(h, attn_proj)
-
-  let h2 = matrix.rms_norm_rows(x_attn, ffn_norm_gamma, eps)
-  let gate = matrix.linear_q1_0_row_no_bias(h2, raw, base + wgate_info.offset, ffn_hidden, hidden)
-  let up = matrix.linear_q1_0_row_no_bias(h2, raw, base + wup_info.offset, ffn_hidden, hidden)
-  let gated = matrix.silu_mul(gate, up)
-  let ffn_out = matrix.linear_q1_0_row_no_bias(gated, raw, base + wdown_info.offset, hidden, ffn_hidden)
-  ok(matrix.add(x_attn, ffn_out))
+  let attn_out = kernels.masked_multi_head_attention(q_rot, k_full, v_full, n_q_heads)
+  let attn_proj = kernels.linear_q1_0_row_no_bias(
+    attn_out,
+    raw,
+    base + wo_info.offset,
+    hidden,
+    hidden,
+  )
+  let x_attn = (h + attn_proj)
+  let h2 = kernels.rms_norm_rows(x_attn, ffn_norm_gamma, eps)
+  let gate = kernels.linear_q1_0_row_no_bias(h2, raw, base + wgate_info.offset, ffn_hidden, hidden)
+  let up = kernels.linear_q1_0_row_no_bias(h2, raw, base + wup_info.offset, ffn_hidden, hidden)
+  let gated = kernels.silu_mul(gate, up)
+  let ffn_out = kernels.linear_q1_0_row_no_bias(
+    gated,
+    raw,
+    base + wdown_info.offset,
+    hidden,
+    ffn_hidden,
+  )
+  ok((x_attn + ffn_out))
 }
 
 // Predict the next-token id given the full Bonsai GGUF bytes and a
@@ -114,7 +171,6 @@ effect fn run_layer_q1_0(
 // is ever fully decoded, so peak memory stays inside WASM's 4 GB cap.
 effect fn predict_next(model_bytes: Bytes, tokens: List[Int]) -> Result[Int, String] = {
   let file = gguf.parse(model_bytes)!
-
   let n_q_heads = 16
   let n_kv_heads = 8
   let head_dim = 128
@@ -123,37 +179,33 @@ effect fn predict_next(model_bytes: Bytes, tokens: List[Int]) -> Result[Int, Str
   let eps = 0.000001
   let n_layers = 28
   let hidden = n_q_heads * head_dim
-
   // Embedding lookup: decode only the rows the prompt actually needs,
   // straight from the packed Q1_0 bytes. Saves the 2.5 GB full-matrix
   // allocation that was formerly needed per call.
   let embd_info = find_tensor(file, "token_embd.weight")!
-  let embd_cols = list.get(embd_info.dims, 0) |> option.unwrap_or(hidden)
+  let embd_cols = list.get(embd_info.dims, 0) ?? hidden
   let embd_offset = file.data_offset + embd_info.offset
-  var h = matrix.select_rows_q1_0(file.raw, embd_offset, embd_cols, tokens)
-
-  for layer in 0..n_layers {
-    h = run_layer_q1_0(file, h, layer,
-      n_q_heads, n_kv_heads, head_dim, ffn_hidden, rope_theta, eps)!
+  var h = kernels.select_rows_q1_0(file.raw, embd_offset, embd_cols, tokens)
+  for layer in 0..<n_layers {
+    h = run_layer_q1_0(file, h, layer, n_q_heads, n_kv_heads, head_dim, ffn_hidden, rope_theta, eps)!
   }
-
   let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
-  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
+  let normed = kernels.rms_norm_rows(h, output_norm_gamma, eps)
   // lm_head ties to token_embd — and we already have it materialised above.
   // Use linear_q1_0_row_no_bias so lm_head doesn't require the decoded matrix
   // once q1_0_select_rows replaces the extract_q1_0_matrix above.
-  let vocab = list.get(embd_info.dims, 1) |> option.unwrap_or(1)
-  let logits = matrix.linear_q1_0_row_no_bias(normed, file.raw, embd_offset, vocab, embd_cols)
-
+  let vocab = list.get(embd_info.dims, 1) ?? 1
+  let logits = kernels.linear_q1_0_row_no_bias(normed, file.raw, embd_offset, vocab, embd_cols)
   let (lr, _lc) = matrix.shape(logits)
-  let last_row = matrix.to_lists(logits) |> list.get(lr - 1) |> option.unwrap_or([])
-  let (best_id, _best_v) = last_row
-    |> list.enumerate
-    |> list.fold((0, -1000000000.0), (acc, entry) => {
+  let last_row = (matrix.to_lists(logits) |> list.get(lr - 1)) ?? []
+  let (best_id, _best_v) = last_row |> list.enumerate |> list.fold(
+    (0, -1000000000.0),
+    (acc, entry) => {
       let (bi, bv) = acc
       let (i, v) = entry
       if v > bv then (i, v) else (bi, bv)
-    })
+    },
+  )
   ok(best_id)
 }
 
@@ -165,7 +217,7 @@ effect fn predict_next(model_bytes: Bytes, tokens: List[Int]) -> Result[Int, Str
 effect fn predict_tokens(model_bytes: Bytes, tokens: List[Int], n_new: Int) -> Result[List[Int], String] = {
   var context = tokens
   var out: List[Int] = []
-  for _ in 0..n_new {
+  for _ in 0..<n_new {
     let next = predict_next(model_bytes, context)!
     list.push(out, next)
     list.push(context, next)
@@ -182,26 +234,26 @@ effect fn predict_tokens(model_bytes: Bytes, tokens: List[Int], n_new: Int) -> R
 // next-token prediction. On the first call you pass `start_pos = 0`
 // and 28 zero-row caches; subsequent calls pass the returned caches
 // plus `start_pos = last_start + new_tokens.len`.
-effect fn run_layer_q1_0_kv(
-  file: gguf.GGUFFile,
-  h: Matrix,
-  k_cache: Matrix,
-  v_cache: Matrix,
-  start_pos: Int,
-  layer: Int,
-  n_q_heads: Int, n_kv_heads: Int, head_dim: Int,
-  ffn_hidden: Int,
-  rope_theta: Float, eps: Float,
-) -> Result[(Matrix, Matrix, Matrix), String] = {
+effect fn run_layer_q1_0_kv(file: gguf.GGUFFile, h: Matrix, k_cache: Matrix, v_cache: Matrix, start_pos: Int, layer: Int, n_q_heads: Int, n_kv_heads: Int, head_dim: Int, ffn_hidden: Int, rope_theta: Float, eps: Float) -> Result[(Matrix, Matrix, Matrix), String] = {
   let hidden = n_q_heads * head_dim
   let kv_hidden = n_kv_heads * head_dim
   let n_rep = n_q_heads / n_kv_heads
-
-  let attn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!)
-  let q_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!)
-  let k_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!)
-  let ffn_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!)
-
+  let attn_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_norm.weight"))!,
+  )
+  let q_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_q_norm.weight"))!,
+  )
+  let k_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "attn_k_norm.weight"))!,
+  )
+  let ffn_norm_gamma = gguf.extract_f32_tensor(
+    file,
+    find_tensor(file, block_tensor_name(layer, "ffn_norm.weight"))!,
+  )
   let wq_info = find_tensor(file, block_tensor_name(layer, "attn_q.weight"))!
   let wk_info = find_tensor(file, block_tensor_name(layer, "attn_k.weight"))!
   let wv_info = find_tensor(file, block_tensor_name(layer, "attn_v.weight"))!
@@ -209,47 +261,65 @@ effect fn run_layer_q1_0_kv(
   let wgate_info = find_tensor(file, block_tensor_name(layer, "ffn_gate.weight"))!
   let wup_info = find_tensor(file, block_tensor_name(layer, "ffn_up.weight"))!
   let wdown_info = find_tensor(file, block_tensor_name(layer, "ffn_down.weight"))!
-
   let base = file.data_offset
   let raw = file.raw
-
-  let h_normed = matrix.rms_norm_rows(h, attn_norm_gamma, eps)
-  let q_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wq_info.offset, hidden, hidden)
-  let k_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wk_info.offset, kv_hidden, hidden)
-  let v_proj = matrix.linear_q1_0_row_no_bias(h_normed, raw, base + wv_info.offset, kv_hidden, hidden)
-
+  let h_normed = kernels.rms_norm_rows(h, attn_norm_gamma, eps)
+  let q_proj = kernels.linear_q1_0_row_no_bias(h_normed, raw, base + wq_info.offset, hidden, hidden)
+  let k_proj = kernels.linear_q1_0_row_no_bias(
+    h_normed,
+    raw,
+    base + wk_info.offset,
+    kv_hidden,
+    hidden,
+  )
+  let v_proj = kernels.linear_q1_0_row_no_bias(
+    h_normed,
+    raw,
+    base + wv_info.offset,
+    kv_hidden,
+    hidden,
+  )
   let q_normed = q3.per_head_rms_norm(q_proj, q_norm_gamma, n_q_heads, eps)
   let k_normed = q3.per_head_rms_norm(k_proj, k_norm_gamma, n_kv_heads, eps)
-
-  let q_rot = matrix.rope_rotate_at(q_normed, n_q_heads, head_dim, rope_theta, start_pos)
-  let k_rot = matrix.rope_rotate_at(k_normed, n_kv_heads, head_dim, rope_theta, start_pos)
-
+  let q_rot = kernels.rope_rotate_at(q_normed, n_q_heads, head_dim, rope_theta, start_pos)
+  let k_rot = kernels.rope_rotate_at(k_normed, n_kv_heads, head_dim, rope_theta, start_pos)
   // Accumulate K/V with the running cache, then broadcast across heads.
-  let k_full_kv = matrix.append_rows(k_cache, k_rot)
-  let v_full_kv = matrix.append_rows(v_cache, v_proj)
+  let k_full_kv = matrix.concat_rows([k_cache, k_rot])
+  let v_full_kv = matrix.concat_rows([v_cache, v_proj])
   let k_full = q3.repeat_kv(k_full_kv, n_kv_heads, n_rep)
   let v_full = q3.repeat_kv(v_full_kv, n_kv_heads, n_rep)
-
-  let attn_out = matrix.masked_multi_head_attention(q_rot, k_full, v_full, n_q_heads)
-  let attn_proj = matrix.linear_q1_0_row_no_bias(attn_out, raw, base + wo_info.offset, hidden, hidden)
-  let x_attn = matrix.add(h, attn_proj)
-
-  let h2 = matrix.rms_norm_rows(x_attn, ffn_norm_gamma, eps)
-  let gate = matrix.linear_q1_0_row_no_bias(h2, raw, base + wgate_info.offset, ffn_hidden, hidden)
-  let up = matrix.linear_q1_0_row_no_bias(h2, raw, base + wup_info.offset, ffn_hidden, hidden)
-  let gated = matrix.silu_mul(gate, up)
-  let ffn_out = matrix.linear_q1_0_row_no_bias(gated, raw, base + wdown_info.offset, hidden, ffn_hidden)
-  ok((matrix.add(x_attn, ffn_out), k_full_kv, v_full_kv))
+  let attn_out = kernels.masked_multi_head_attention(q_rot, k_full, v_full, n_q_heads)
+  let attn_proj = kernels.linear_q1_0_row_no_bias(
+    attn_out,
+    raw,
+    base + wo_info.offset,
+    hidden,
+    hidden,
+  )
+  let x_attn = (h + attn_proj)
+  let h2 = kernels.rms_norm_rows(x_attn, ffn_norm_gamma, eps)
+  let gate = kernels.linear_q1_0_row_no_bias(h2, raw, base + wgate_info.offset, ffn_hidden, hidden)
+  let up = kernels.linear_q1_0_row_no_bias(h2, raw, base + wup_info.offset, ffn_hidden, hidden)
+  let gated = kernels.silu_mul(gate, up)
+  let ffn_out = kernels.linear_q1_0_row_no_bias(
+    gated,
+    raw,
+    base + wdown_info.offset,
+    hidden,
+    ffn_hidden,
+  )
+  ok(((x_attn + ffn_out), k_full_kv, v_full_kv))
 }
 
 fn argmax_f64(logits: List[Float]) -> Int = {
-  let (best_id, _best_v) = logits
-    |> list.enumerate
-    |> list.fold((0, -1.0e30), (acc, entry) => {
+  let (best_id, _best_v) = logits |> list.enumerate |> list.fold(
+    (0, -1.0e30),
+    (acc, entry) => {
       let (bi, bv) = acc
       let (i, v) = entry
       if v > bv then (i, v) else (bi, bv)
-    })
+    },
+  )
   best_id
 }
 
@@ -262,9 +332,11 @@ fn pick_cumulative(weights: List[Float], target: Float) -> Int = {
   var i = 0
   let n = list.len(weights)
   while i < n and chosen < 0 {
-    let w = list.get(weights, i) |> option.unwrap_or(0.0)
+    let w = list.get(weights, i) ?? 0.0
     acc = acc + w
-    if acc >= target then { chosen = i }
+    if acc >= target then {
+      chosen = i
+    } else ()
     i = i + 1
   }
   if chosen >= 0 then chosen else n - 1
@@ -284,14 +356,17 @@ fn top_k_threshold(xs: List[Float], k: Int) -> Float = {
     var j = 0
     let n = list.len(remaining)
     while j < n {
-      let v = list.get(remaining, j) |> option.unwrap_or(-1.0e30)
-      if v > best_v then { best_v = v; best_i = j }
+      let v = list.get(remaining, j) ?? -1.0e30
+      if v > best_v then {
+        best_v = v
+        best_i = j
+      } else ()
       j = j + 1
     }
     if best_i >= 0 then {
       remaining = list.set(remaining, best_i, -1.0e30)
       kth = best_v
-    }
+    } else ()
     step = step + 1
   }
   kth
@@ -315,40 +390,21 @@ fn apply_repetition_penalty(logits: List[Float], recent: List[Int], penalty: Flo
 // Greedy when temperature <= 0 or top_k <= 1. Otherwise: penalize
 // recent tokens → scale by temperature → keep the top_k largest →
 // softmax → pick by cumulative weight with `rand01` in [0, 1).
-fn sample_from_logits(
-  logits: List[Float],
-  temperature: Float,
-  top_k: Int,
-  rand01: Float,
-  recent: List[Int],
-  repeat_penalty: Float,
-) -> Int = {
+fn sample_from_logits(logits: List[Float], temperature: Float, top_k: Int, rand01: Float, recent: List[Int], repeat_penalty: Float) -> Int = {
   let penalised = apply_repetition_penalty(logits, recent, repeat_penalty)
   if temperature <= 0.0 or top_k <= 1 then argmax_f64(penalised)
   else {
     let scaled = penalised |> list.map((v) => v / temperature)
     let threshold = top_k_threshold(scaled, top_k)
     let max_v = list.fold(scaled, -1.0e30, (a, b) => if a > b then a else b)
-    let exps = scaled |> list.map((v) =>
-      if v >= threshold then math.exp(v - max_v) else 0.0)
+    let exps = scaled |> list.map((v) => if v >= threshold then math.exp(v - max_v) else 0.0)
     let sum = list.fold(exps, 0.0, (a, b) => a + b)
     if sum <= 0.0 then argmax_f64(penalised)
     else pick_cumulative(exps, rand01 * sum)
   }
 }
 
-effect fn predict_next_kv(
-  file: gguf.GGUFFile,
-  kv_keys: List[Matrix],
-  kv_values: List[Matrix],
-  new_tokens: List[Int],
-  start_pos: Int,
-  temperature: Float,
-  top_k: Int,
-  rand01: Float,
-  recent: List[Int],
-  repeat_penalty: Float,
-) -> Result[(Int, List[Matrix], List[Matrix]), String] = {
+effect fn predict_next_kv(file: gguf.GGUFFile, kv_keys: List[Matrix], kv_values: List[Matrix], new_tokens: List[Int], start_pos: Int, temperature: Float, top_k: Int, rand01: Float, recent: List[Int], repeat_penalty: Float) -> Result[(Int, List[Matrix], List[Matrix]), String] = {
   let n_q_heads = 16
   let n_kv_heads = 8
   let head_dim = 128
@@ -358,34 +414,39 @@ effect fn predict_next_kv(
   let n_layers = 28
   let hidden = n_q_heads * head_dim
   let kv_hidden = n_kv_heads * head_dim
-
   let embd_info = find_tensor(file, "token_embd.weight")!
-  let embd_cols = list.get(embd_info.dims, 0) |> option.unwrap_or(hidden)
+  let embd_cols = list.get(embd_info.dims, 0) ?? hidden
   let embd_offset = file.data_offset + embd_info.offset
-
-  var h = matrix.select_rows_q1_0(file.raw, embd_offset, embd_cols, new_tokens)
+  var h = kernels.select_rows_q1_0(file.raw, embd_offset, embd_cols, new_tokens)
   var new_keys = list.take(kv_keys, list.len(kv_keys))
   var new_values = list.take(kv_values, list.len(kv_values))
-
-  for layer in 0..n_layers {
-    let k_cache = list.get(kv_keys, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
-    let v_cache = list.get(kv_values, layer) |> option.unwrap_or(matrix.zeros(0, kv_hidden))
+  for layer in 0..<n_layers {
+    let k_cache = list.get(kv_keys, layer) ?? matrix.zeros(0, kv_hidden)
+    let v_cache = list.get(kv_values, layer) ?? matrix.zeros(0, kv_hidden)
     let (h_next, k_new, v_new) = run_layer_q1_0_kv(
-      file, h, k_cache, v_cache, start_pos, layer,
-      n_q_heads, n_kv_heads, head_dim, ffn_hidden, rope_theta, eps,
+      file,
+      h,
+      k_cache,
+      v_cache,
+      start_pos,
+      layer,
+      n_q_heads,
+      n_kv_heads,
+      head_dim,
+      ffn_hidden,
+      rope_theta,
+      eps,
     )!
     h = h_next
     new_keys = list.set(new_keys, layer, k_new)
     new_values = list.set(new_values, layer, v_new)
   }
-
   let output_norm_gamma = gguf.extract_f32_tensor(file, find_tensor(file, "output_norm.weight")!)
-  let normed = matrix.rms_norm_rows(h, output_norm_gamma, eps)
-  let vocab = list.get(embd_info.dims, 1) |> option.unwrap_or(1)
-  let logits = matrix.linear_q1_0_row_no_bias(normed, file.raw, embd_offset, vocab, embd_cols)
-
+  let normed = kernels.rms_norm_rows(h, output_norm_gamma, eps)
+  let vocab = list.get(embd_info.dims, 1) ?? 1
+  let logits = kernels.linear_q1_0_row_no_bias(normed, file.raw, embd_offset, vocab, embd_cols)
   let (lr, _lc) = matrix.shape(logits)
-  let last_row = matrix.to_lists(logits) |> list.get(lr - 1) |> option.unwrap_or([])
+  let last_row = (matrix.to_lists(logits) |> list.get(lr - 1)) ?? []
   let chosen_id = sample_from_logits(last_row, temperature, top_k, rand01, recent, repeat_penalty)
   ok((chosen_id, new_keys, new_values))
 }
@@ -404,124 +465,110 @@ effect fn predict_next_kv(
 // `init_model` + `predict_*_cached` skip the per-step `gguf.parse` by
 // parsing once at boot (JS keeps the GGUFFile pointer below the heap
 // watermark so it survives __heap_restore).
+effect fn init_model(model_bytes: Bytes) -> Result[gguf.GGUFFile, String] = ok(gguf.parse(model_bytes)!)
 
-effect fn init_model(model_bytes: Bytes) -> Result[gguf.GGUFFile, String] =
-  ok(gguf.parse(model_bytes)!)
-
-effect fn predict_prompt_kv_cached(
-  file: gguf.GGUFFile,
-  prompt: List[Int],
-  temperature: Float,
-  top_k: Int,
-  rand01: Float,
-  repeat_penalty: Float,
-) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
+effect fn predict_prompt_kv_cached(file: gguf.GGUFFile, prompt: List[Int], temperature: Float, top_k: Int, rand01: Float, repeat_penalty: Float) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
   let kv_hidden = 8 * 128
   let n_layers = 28
-
   var keys: List[Matrix] = []
   var values: List[Matrix] = []
-  for _ in 0..n_layers {
+  for _ in 0..<n_layers {
     list.push(keys, matrix.zeros(0, kv_hidden))
     list.push(values, matrix.zeros(0, kv_hidden))
   }
-
   let (next, new_keys, new_values) = predict_next_kv(
-    file, keys, values, prompt, 0,
-    temperature, top_k, rand01, prompt, repeat_penalty,
+    file,
+    keys,
+    values,
+    prompt,
+    0,
+    temperature,
+    top_k,
+    rand01,
+    prompt,
+    repeat_penalty,
   )!
   let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
   let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
   ok((next, k_bytes, v_bytes))
 }
 
-effect fn predict_step_kv_cached(
-  file: gguf.GGUFFile,
-  kv_keys_bytes: List[Bytes],
-  kv_values_bytes: List[Bytes],
-  last_token: Int,
-  start_pos: Int,
-  recent_tokens: List[Int],
-  temperature: Float,
-  top_k: Int,
-  rand01: Float,
-  repeat_penalty: Float,
-) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
+effect fn predict_step_kv_cached(file: gguf.GGUFFile, kv_keys_bytes: List[Bytes], kv_values_bytes: List[Bytes], last_token: Int, start_pos: Int, recent_tokens: List[Int], temperature: Float, top_k: Int, rand01: Float, repeat_penalty: Float) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
   let kv_hidden = 8 * 128
-
   let keys = kv_keys_bytes |> list.map((b) => {
     let rows = bytes.len(b) / 8 / kv_hidden
-    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden) ?? panic("matrix.from_bytes_f64_le: out of range")
   })
   let values = kv_values_bytes |> list.map((b) => {
     let rows = bytes.len(b) / 8 / kv_hidden
-    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden) ?? panic("matrix.from_bytes_f64_le: out of range")
   })
-
   let (next, new_keys, new_values) = predict_next_kv(
-    file, keys, values, [last_token], start_pos,
-    temperature, top_k, rand01, recent_tokens, repeat_penalty,
+    file,
+    keys,
+    values,
+    [last_token],
+    start_pos,
+    temperature,
+    top_k,
+    rand01,
+    recent_tokens,
+    repeat_penalty,
   )!
   let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
   let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
   ok((next, k_bytes, v_bytes))
 }
 
-effect fn predict_prompt_kv_bytes(
-  model_bytes: Bytes,
-  prompt: List[Int],
-  temperature: Float,
-  top_k: Int,
-  rand01: Float,
-  repeat_penalty: Float,
-) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
+effect fn predict_prompt_kv_bytes(model_bytes: Bytes, prompt: List[Int], temperature: Float, top_k: Int, rand01: Float, repeat_penalty: Float) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
   let file = gguf.parse(model_bytes)!
   let kv_hidden = 8 * 128
   let n_layers = 28
-
   var keys: List[Matrix] = []
   var values: List[Matrix] = []
-  for _ in 0..n_layers {
+  for _ in 0..<n_layers {
     list.push(keys, matrix.zeros(0, kv_hidden))
     list.push(values, matrix.zeros(0, kv_hidden))
   }
-
   let (next, new_keys, new_values) = predict_next_kv(
-    file, keys, values, prompt, 0,
-    temperature, top_k, rand01, prompt, repeat_penalty,
+    file,
+    keys,
+    values,
+    prompt,
+    0,
+    temperature,
+    top_k,
+    rand01,
+    prompt,
+    repeat_penalty,
   )!
   let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
   let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
   ok((next, k_bytes, v_bytes))
 }
 
-effect fn predict_step_kv_bytes(
-  model_bytes: Bytes,
-  kv_keys_bytes: List[Bytes],
-  kv_values_bytes: List[Bytes],
-  last_token: Int,
-  start_pos: Int,
-  recent_tokens: List[Int],
-  temperature: Float,
-  top_k: Int,
-  rand01: Float,
-  repeat_penalty: Float,
-) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
+effect fn predict_step_kv_bytes(model_bytes: Bytes, kv_keys_bytes: List[Bytes], kv_values_bytes: List[Bytes], last_token: Int, start_pos: Int, recent_tokens: List[Int], temperature: Float, top_k: Int, rand01: Float, repeat_penalty: Float) -> Result[(Int, List[Bytes], List[Bytes]), String] = {
   let file = gguf.parse(model_bytes)!
   let kv_hidden = 8 * 128
-
   let keys = kv_keys_bytes |> list.map((b) => {
     let rows = bytes.len(b) / 8 / kv_hidden
-    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden) ?? panic("matrix.from_bytes_f64_le: out of range")
   })
   let values = kv_values_bytes |> list.map((b) => {
     let rows = bytes.len(b) / 8 / kv_hidden
-    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden)
+    matrix.from_bytes_f64_le(b, 0, rows, kv_hidden) ?? panic("matrix.from_bytes_f64_le: out of range")
   })
-
   let (next, new_keys, new_values) = predict_next_kv(
-    file, keys, values, [last_token], start_pos,
-    temperature, top_k, rand01, recent_tokens, repeat_penalty,
+    file,
+    keys,
+    values,
+    [last_token],
+    start_pos,
+    temperature,
+    top_k,
+    rand01,
+    recent_tokens,
+    repeat_penalty,
   )!
   let k_bytes = new_keys |> list.map((m) => matrix.to_bytes_f64_le(m))
   let v_bytes = new_values |> list.map((m) => matrix.to_bytes_f64_le(m))
@@ -533,27 +580,39 @@ effect fn predict_step_kv_bytes(
 // bench path 2 (List[Bytes] shuttling) → the bug is in the step-wise
 // forward itself. If it returns the path-4 token → the bug is in
 // serialization.
-effect fn probe_prompt_then_step(
-  model_bytes: Bytes,
-  prompt: List[Int],
-  follow_token: Int,
-) -> Result[Int, String] = {
+effect fn probe_prompt_then_step(model_bytes: Bytes, prompt: List[Int], follow_token: Int) -> Result[Int, String] = {
   let file = gguf.parse(model_bytes)!
   let kv_hidden = 8 * 128
   let n_layers = 28
-
   var keys: List[Matrix] = []
   var values: List[Matrix] = []
-  for _ in 0..n_layers {
+  for _ in 0..<n_layers {
     list.push(keys, matrix.zeros(0, kv_hidden))
     list.push(values, matrix.zeros(0, kv_hidden))
   }
-
   let (_first, k1, v1) = predict_next_kv(
-    file, keys, values, prompt, 0, 0.0, 1, 0.0, [], 1.0,
+    file,
+    keys,
+    values,
+    prompt,
+    0,
+    0.0,
+    1,
+    0.0,
+    [],
+    1.0,
   )!
   let (second, _k2, _v2) = predict_next_kv(
-    file, k1, v1, [follow_token], list.len(prompt), 0.0, 1, 0.0, [], 1.0,
+    file,
+    k1,
+    v1,
+    [follow_token],
+    list.len(prompt),
+    0.0,
+    1,
+    0.0,
+    [],
+    1.0,
   )!
   ok(second)
 }
@@ -567,14 +626,12 @@ effect fn predict_tokens_kv(model_bytes: Bytes, prompt: List[Int], n_new: Int) -
   let file = gguf.parse(model_bytes)!
   let kv_hidden = 8 * 128
   let n_layers = 28
-
   var keys: List[Matrix] = []
   var values: List[Matrix] = []
-  for _ in 0..n_layers {
+  for _ in 0..<n_layers {
     list.push(keys, matrix.zeros(0, kv_hidden))
     list.push(values, matrix.zeros(0, kv_hidden))
   }
-
   var out: List[Int] = []
   let (first, k1, v1) = predict_next_kv(file, keys, values, prompt, 0, 0.0, 1, 0.0, [], 1.0)!
   keys = k1
@@ -582,8 +639,19 @@ effect fn predict_tokens_kv(model_bytes: Bytes, prompt: List[Int], n_new: Int) -
   list.push(out, first)
   var pos = list.len(prompt)
   var last = first
-  for _ in 0..(n_new - 1) {
-    let (next, k_upd, v_upd) = predict_next_kv(file, keys, values, [last], pos, 0.0, 1, 0.0, [], 1.0)!
+  for _ in 0..<(n_new - 1) {
+    let (next, k_upd, v_upd) = predict_next_kv(
+      file,
+      keys,
+      values,
+      [last],
+      pos,
+      0.0,
+      1,
+      0.0,
+      [],
+      1.0,
+    )!
     keys = k_upd
     values = v_upd
     list.push(out, next)
@@ -607,7 +675,10 @@ effect fn tensor_count(model_bytes: Bytes) -> Result[Int, String] = {
 // Debug: return the header's tensor_count field without parsing tensor infos.
 effect fn header_tensor_count(model_bytes: Bytes) -> Result[Int, String] = {
   match gguf.parse_header(model_bytes) {
-    ok(r) => { let (header, _pos) = r; ok(header.tensor_count) },
+    ok(r) => {
+      let (header, _pos) = r
+      ok(header.tensor_count)
+    },
     err(e) => err(e),
   }
 }
@@ -615,23 +686,22 @@ effect fn header_tensor_count(model_bytes: Bytes) -> Result[Int, String] = {
 // Even more primitive: return the first 4 bytes of the file as a packed
 // integer. For a valid GGUF file this should be 0x46554747 (LE "GGUF").
 fn first_u32(model_bytes: Bytes) -> Int = {
-  let b0 = bytes.get(model_bytes, 0) |> option.unwrap_or(0)
-  let b1 = bytes.get(model_bytes, 1) |> option.unwrap_or(0)
-  let b2 = bytes.get(model_bytes, 2) |> option.unwrap_or(0)
-  let b3 = bytes.get(model_bytes, 3) |> option.unwrap_or(0)
+  let b0 = bytes.get(model_bytes, 0) ?? 0
+  let b1 = bytes.get(model_bytes, 1) ?? 0
+  let b2 = bytes.get(model_bytes, 2) ?? 0
+  let b3 = bytes.get(model_bytes, 3) ?? 0
   b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
 }
 
-fn first_byte(model_bytes: Bytes) -> Int =
-  bytes.get(model_bytes, 0) |> option.unwrap_or(99)
+fn first_byte(model_bytes: Bytes) -> Int = bytes.get(model_bytes, 0) ?? 99
 
 // Offset 8 is the start of tensor_count (u64 LE) in a GGUF v3 header.
 // Expected value: 310 for Bonsai-1.7B (0x136).
 fn raw_u32_at(model_bytes: Bytes, pos: Int) -> Int = {
-  let b0 = bytes.get(model_bytes, pos) |> option.unwrap_or(0)
-  let b1 = bytes.get(model_bytes, pos + 1) |> option.unwrap_or(0)
-  let b2 = bytes.get(model_bytes, pos + 2) |> option.unwrap_or(0)
-  let b3 = bytes.get(model_bytes, pos + 3) |> option.unwrap_or(0)
+  let b0 = bytes.get(model_bytes, pos) ?? 0
+  let b1 = bytes.get(model_bytes, pos + 1) ?? 0
+  let b2 = bytes.get(model_bytes, pos + 2) ?? 0
+  let b3 = bytes.get(model_bytes, pos + 3) ?? 0
   b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
 }
 
@@ -647,17 +717,21 @@ effect fn header_fields(model_bytes: Bytes) -> Result[(Int, Int, Int), String] =
   }
 }
 
-effect fn header_version(model_bytes: Bytes) -> Result[Int, String] =
-  match gguf.parse_header(model_bytes) {
-    ok(r) => { let (header, _p) = r; ok(header.version) },
-    err(e) => err(e),
-  }
+effect fn header_version(model_bytes: Bytes) -> Result[Int, String] = match gguf.parse_header(model_bytes) {
+  ok(r) => {
+    let (header, _p) = r
+    ok(header.version)
+  },
+  err(e) => err(e),
+}
 
-effect fn header_metadata_count(model_bytes: Bytes) -> Result[Int, String] =
-  match gguf.parse_header(model_bytes) {
-    ok(r) => { let (header, _p) = r; ok(header.metadata_count) },
-    err(e) => err(e),
-  }
+effect fn header_metadata_count(model_bytes: Bytes) -> Result[Int, String] = match gguf.parse_header(model_bytes) {
+  ok(r) => {
+    let (header, _p) = r
+    ok(header.metadata_count)
+  },
+  err(e) => err(e),
+}
 
 // Extract one small Q1_0 tensor (blk.0.attn_k.weight, 2M weights, ~16 MB
 // output Matrix) to verify the intrinsic runs in WASM without touching
@@ -667,7 +741,7 @@ effect fn extract_attn_k_first_value(model_bytes: Bytes) -> Result[Float, String
   match list.find(file.tensors, (t) => t.name == "blk.0.attn_k.weight") {
     some(info) => {
       let m = gguf.extract_q1_0_matrix(file, info)
-      ok(matrix.get(m, 0, 0))
+      ok(matrix.get(m, 0, 0) ?? panic("matrix.get: out of range"))
     },
     none => err("blk.0.attn_k.weight not found"),
   }
@@ -679,8 +753,8 @@ effect fn token_embd_dims(model_bytes: Bytes) -> Result[(Int, Int, Int), String]
   let file = gguf.parse(model_bytes)!
   match list.find(file.tensors, (t) => t.name == "token_embd.weight") {
     some(info) => {
-      let d0 = list.get(info.dims, 0) |> option.unwrap_or(-1)
-      let d1 = list.get(info.dims, 1) |> option.unwrap_or(-1)
+      let d0 = list.get(info.dims, 0) ?? -1
+      let d1 = list.get(info.dims, 1) ?? -1
       ok((list.len(info.dims), d0, d1))
     },
     none => err("token_embd not found"),
@@ -693,7 +767,7 @@ effect fn extract_token_embd_first(model_bytes: Bytes) -> Result[Float, String] 
   match list.find(file.tensors, (t) => t.name == "token_embd.weight") {
     some(info) => {
       let m = gguf.extract_q1_0_matrix(file, info)
-      ok(matrix.get(m, 0, 0))
+      ok(matrix.get(m, 0, 0) ?? panic("matrix.get: out of range"))
     },
     none => err("token_embd not found"),
   }
@@ -709,7 +783,7 @@ effect fn one_layer_first_value(model_bytes: Bytes, tokens: List[Int]) -> Result
   let rope_theta = 1000000.0
   let eps = 0.000001
   let token_embd = gguf.extract_q1_0_matrix(file, find_tensor(file, "token_embd.weight")!)
-  let h_input = matrix.select_rows(token_embd, tokens)
+  let h_input = matrix.gather_rows(token_embd, tokens)
   let h_out = run_layer(file, h_input, 0, n_q_heads, n_kv_heads, head_dim, rope_theta, eps)!
-  ok(matrix.get(h_out, 0, 0))
+  ok(matrix.get(h_out, 0, 0) ?? panic("matrix.get: out of range"))
 }
